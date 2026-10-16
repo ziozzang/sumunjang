@@ -1,10 +1,39 @@
 syntax = "proto3";
 package hangang.sumunjang.v1;
 service Network { rpc Check(NetworkRequest) returns (NetworkReply); }
-message NetworkRequest { uint64 request_id = 1; bytes ip = 2; uint64 minimum_revision = 3; }
+// Fields 1-3 are the original contract. include_evidence (4) is additive: when
+// false or absent the reply is byte-identical to the original reply.
+message NetworkRequest {
+ uint64 request_id = 1; bytes ip = 2; uint64 minimum_revision = 3;
+ bool include_evidence = 4;
+}
 message NetworkReply {
  uint64 request_id = 1; uint64 revision = 2; Verdict verdict = 3;
  Mode mode = 4; uint32 ttl_ms = 5;
+ // Present only when requested. Describes the same evaluation as the verdict.
+ NetworkEvidence evidence = 6;
 }
 enum Verdict { VERDICT_UNSPECIFIED = 0; VERDICT_ALLOW = 1; VERDICT_DENY = 2; VERDICT_UNAVAILABLE = 3; }
 enum Mode { MODE_UNSPECIFIED = 0; MODE_OBSERVE = 1; MODE_ENFORCE = 2; }
+enum DecidingStage {
+ DECIDING_STAGE_UNSPECIFIED = 0; DECIDING_STAGE_OBSERVE = 1; DECIDING_STAGE_ALLOWLIST = 2;
+ DECIDING_STAGE_RULE = 3; DECIDING_STAGE_BLOCK = 4; DECIDING_STAGE_DEFAULT = 5;
+}
+message NetworkEvidence {
+ // Stable sumunjang.* reason code (en/ko catalogs: GET /v1/reasons).
+ string reason_code = 1;
+ DecidingStage deciding_stage = 2;
+ // Matching active rule IDs in precedence order (winner first), at most 8.
+ repeated string rule_ids = 3;
+ bool rule_ids_truncated = 4;
+ // Most specific active covering block network, empty when none.
+ string block_network = 5;
+ // 0 = unknown.
+ uint32 asn = 6;
+ // ISO 3166-1 alpha-2, empty when unknown.
+ string country = 7;
+ // What enforcement of the same published policy decides (equals verdict in
+ // enforce mode; meaningful while the policy is observed).
+ Verdict enforce_verdict = 8;
+ string enforce_reason_code = 9;
+}

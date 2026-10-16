@@ -2,7 +2,7 @@
 use crate::App;
 use anyhow::Result;
 use guard_grpc::v1::{
-    NetworkReply, NetworkRequest,
+    NetworkEvidence, NetworkReply, NetworkRequest,
     network_server::{Network, NetworkServer},
 };
 pub use hangang_runtime::configuration;
@@ -67,6 +67,14 @@ impl Network for Service {
             _ => return Err(Status::invalid_argument("invalid address size")),
         };
         let view = self.app.view.load_full();
+        if input.include_evidence {
+            return Ok(Response::new(self.reply_with_evidence(
+                input.request_id,
+                input.minimum_revision,
+                &view,
+                ip,
+            )));
+        }
         let geo = view.requires_geo().then(|| self.app.geo.load_full());
         let decision = match &geo {
             Some(geo) => view.query_ip_context(ip, crate::now(), geo.context(ip)),
@@ -81,7 +89,70 @@ impl Network for Service {
         )))
     }
 }
+fn stage_number(stage: guard_core::trace::DecidingStage) -> i32 {
+    use guard_core::trace::DecidingStage as S;
+    match stage {
+        S::Observe => 1,
+        S::Allowlist => 2,
+        S::Rule => 3,
+        S::Block => 4,
+        S::Default => 5,
+    }
+}
 impl Service {
+    /// Additive evidence reply. The verdict comes from the same evaluation and
+    /// the same owner fence as [`Service::reply`]; evidence is withheld (only an
+    /// unavailable reason code remains) whenever the reply is unavailable.
+    fn reply_with_evidence(
+        &self,
+        request_id: u64,
+        minimum_revision: u64,
+        view: &Arc<guard_core::DecisionView>,
+        ip: IpAddr,
+    ) -> NetworkReply {
+        let catalog = self.app.geo.load_full();
+        let time = crate::now();
+        let (evidence, _) = crate::explain::decision_evidence(view, &catalog, ip, time);
+        // The verdict itself is the unmodified live decision.
+        let decision = if view.requires_geo() {
+            view.query_ip_context(ip, time, catalog.context(ip))
+        } else {
+            view.query_ip(ip, time)
+        };
+        let captured = view.requires_geo().then_some(&catalog);
+        let mut reply = self.reply(request_id, minimum_revision, view, captured, decision);
+        reply.evidence = Some(if reply.verdict == 3 {
+            let source = self.app.source_remaining(view).is_none();
+            NetworkEvidence {
+                reason_code: if source {
+                    "sumunjang.unavailable.source"
+                } else if decision.revision < minimum_revision {
+                    "sumunjang.unavailable.revision_floor"
+                } else {
+                    "sumunjang.unavailable.owner_replaced"
+                }
+                .into(),
+                ..NetworkEvidence::default()
+            }
+        } else {
+            NetworkEvidence {
+                reason_code: evidence.reason_code.into(),
+                deciding_stage: stage_number(evidence.stage),
+                rule_ids: evidence.rules,
+                rule_ids_truncated: evidence.rules_truncated,
+                block_network: evidence.block_network.unwrap_or_default(),
+                asn: evidence.asn.unwrap_or(0),
+                country: evidence.country.unwrap_or_default(),
+                enforce_verdict: if evidence.enforce_action == "deny" {
+                    2
+                } else {
+                    1
+                },
+                enforce_reason_code: evidence.enforce_reason_code.into(),
+            }
+        });
+        reply
+    }
     fn reply(
         &self,
         request_id: u64,
@@ -117,6 +188,7 @@ impl Service {
             } else {
                 0
             },
+            evidence: None,
         }
     }
 }
@@ -162,6 +234,7 @@ pub(crate) async fn fixture_check(app: App, ip: Vec<u8>) -> Result<NetworkReply,
         request_id: 42,
         ip,
         minimum_revision: 0,
+        include_evidence: false,
     });
     request.metadata_mut().insert(
         "authorization",
@@ -178,11 +251,78 @@ mod tests {
             request_id: 7,
             ip: vec![192, 0, 2, 1],
             minimum_revision: 0,
+            include_evidence: false,
         });
         request
             .metadata_mut()
             .insert("authorization", format!("Bearer {token}").parse().unwrap());
         request
+    }
+    #[test]
+    fn evidence_is_additive_and_withheld_when_unavailable() {
+        let service = Service {
+            app: crate::tests::app(),
+            requests: Arc::new(Semaphore::new(1)),
+        };
+        {
+            let mut inner = service.app.inner.lock().unwrap();
+            let mut policy = inner.engine.policy().clone();
+            policy.mode = guard_core::Mode::Enforce;
+            inner.engine.set_policy(policy).unwrap();
+            inner
+                .engine
+                .set_rules(guard_core::RuleSet {
+                    version: 1,
+                    rules: vec![guard_core::Rule {
+                        id: "net-deny".into(),
+                        priority: 1,
+                        network: Some("192.0.2.0/24".into()),
+                        countries: vec![],
+                        asns: vec![],
+                        action: guard_core::RuleAction::Deny,
+                        score: 0,
+                        expires_at: None,
+                        description: String::new(),
+                    }],
+                })
+                .unwrap();
+            service
+                .app
+                .view
+                .store(Arc::new(inner.engine.decision_view()));
+        }
+        let view = service.app.view.load_full();
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        let plain = service.reply(7, 0, &view, None, view.query_ip(ip, crate::now()));
+        assert!(plain.evidence.is_none());
+        let rich = service.reply_with_evidence(7, 0, &view, ip);
+        assert_eq!(
+            (
+                rich.request_id,
+                rich.revision,
+                rich.verdict,
+                rich.mode,
+                rich.ttl_ms
+            ),
+            (
+                plain.request_id,
+                plain.revision,
+                plain.verdict,
+                plain.mode,
+                plain.ttl_ms
+            )
+        );
+        use prost::Message;
+        assert!(rich.encoded_len() <= 1024);
+        let evidence = rich.evidence.unwrap();
+        assert_eq!(evidence.reason_code, "sumunjang.deny.rule");
+        assert_eq!(evidence.rule_ids, ["net-deny"]);
+        assert_eq!((evidence.deciding_stage, evidence.enforce_verdict), (3, 2));
+        let fenced = service.reply_with_evidence(7, u64::MAX, &view, ip);
+        assert_eq!(fenced.verdict, 3);
+        let evidence = fenced.evidence.unwrap();
+        assert_eq!(evidence.reason_code, "sumunjang.unavailable.revision_floor");
+        assert!(evidence.rule_ids.is_empty() && evidence.block_network.is_empty());
     }
     #[test]
     fn changed_owner_with_same_revision_discards_captured_network_reply() {
