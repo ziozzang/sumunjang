@@ -156,6 +156,18 @@ impl SignalHistory {
                 .collect()
         })
     }
+    /// Every address with retained history: (address, total score, events).
+    pub fn addresses(&self) -> impl Iterator<Item = (IpAddr, u64, u64)> + '_ {
+        self.addresses.iter().map(|(ip, b)| {
+            let (score, events) = b.values().fold((0u64, 0u64), |(s, e), x| {
+                (
+                    s.saturating_add(x.score),
+                    e.saturating_add(x.signals.total()),
+                )
+            });
+            (*ip, score, events)
+        })
+    }
     pub fn stats(&self) -> HistoryStats {
         HistoryStats {
             retention_secs: self.retention,

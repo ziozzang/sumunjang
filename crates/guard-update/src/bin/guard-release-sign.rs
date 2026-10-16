@@ -39,6 +39,25 @@ fn main() -> Result<()> {
         );
         return Ok(());
     }
+    if first == "--asn-bundle" {
+        // Sign an ASN prefix bundle payload (sumunjang.asn-bundle.v1).
+        let mut next = || {
+            arguments.next().map(PathBuf::from).context("usage: guard-release-sign --asn-bundle <payload.json> <base64-seed-file> <envelope.json>")
+        };
+        let (payload_path, key_path, output_path) = (next()?, next()?, next()?);
+        validate_secret_file(&key_path)?;
+        let payload = fs::read(&payload_path).context("read ASN bundle payload")?;
+        let signing_key = signing_key_from_base64(&fs::read_to_string(&key_path)?)?;
+        let envelope = guard_update::signed_bundle::sign(
+            "sumunjang.asn-bundle.v1",
+            &payload,
+            &signing_key,
+            32 * 1024 * 1024,
+        )?;
+        fs::write(&output_path, envelope).context("write signed ASN bundle")?;
+        println!("wrote {}", output_path.display());
+        return Ok(());
+    }
     let payload_path = PathBuf::from(first);
     let key_path = arguments
         .next()

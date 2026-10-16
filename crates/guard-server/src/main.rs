@@ -1,6 +1,7 @@
 mod actor;
 #[cfg(test)]
 mod api_tests;
+mod asn;
 mod audit;
 mod console_api;
 mod explain;
@@ -122,6 +123,20 @@ struct Args {
     bootstrap_policy: Option<PathBuf>,
     #[arg(long)]
     asn_catalog: Option<PathBuf>,
+    /// Verify and install a signed ASN prefix bundle into the database, then exit.
+    #[arg(long)]
+    import_asn_bundle: Option<PathBuf>,
+    /// Optional HTTPS URL of signed ASN prefix bundles (no default).
+    #[arg(long)]
+    asn_bundle_url: Option<String>,
+    /// Additional CA for the bundle URL.
+    #[arg(long, requires = "asn_bundle_url")]
+    asn_bundle_ca: Option<PathBuf>,
+    #[arg(long, default_value_t = 3600, value_parser = clap::value_parser!(u64).range(300..=86_400))]
+    asn_bundle_interval_seconds: u64,
+    /// Distinct approvers (other than the proposer) required for ASN block proposals.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=3))]
+    asn_proposal_approvals: u8,
     #[arg(long)]
     geoip_database: Option<PathBuf>,
     #[arg(long)]
@@ -172,6 +187,8 @@ struct App {
     checkpoint_failed: Arc<std::sync::atomic::AtomicBool>,
     /// Optional read-only credential for `GET /metrics`.
     metrics_token: Option<Arc<String>>,
+    /// ASN bundle key, fetch configuration and two-person rule.
+    asn: Arc<asn::AsnState>,
 }
 /// Optional metrics credential: 16..4096 bytes, distinct from the others.
 fn metrics_token(collector: &str, admin: &str) -> anyhow::Result<Option<String>> {
@@ -328,6 +345,30 @@ fn persist_state_audited(
     Ok(())
 }
 
+/// One transaction: optional checkpoint, owner rows (`extra`) and the audit row.
+fn persist_with(
+    db: &mut Connection,
+    state: Option<&guard_core::State>,
+    record: &audit::Record,
+    retention: audit::Retention,
+    extra: &mut dyn FnMut(&Connection) -> rusqlite::Result<()>,
+) -> Result<(), PersistError> {
+    let encoded = state
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| PersistError::Before(e.into()))?;
+    let tx = db
+        .transaction()
+        .map_err(|e| PersistError::Before(e.into()))?;
+    if let Some(encoded) = encoded {
+        tx.execute("INSERT INTO checkpoint(id,body) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET body=excluded.body", [&encoded]).map_err(|e| PersistError::Before(e.into()))?;
+    }
+    extra(&tx).map_err(|e| PersistError::Before(e.into()))?;
+    audit::insert(&tx, retention, record).map_err(|e| PersistError::Before(e.into()))?;
+    tx.commit().map_err(|e| PersistError::Commit(e.into()))?;
+    Ok(())
+}
+
 /// What an audited policy mutation changes.
 #[derive(Clone, Copy)]
 enum Scope {
@@ -379,7 +420,15 @@ fn scope_summary(scope: Scope, before: &Engine, after: &Engine) -> String {
 fn count(counter: &std::sync::atomic::AtomicU64) {
     counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
-fn record_refusal(app: &App, db: &mut Connection, mut record: audit::Record, message: String) {
+fn record_refusal(app: &App, db: &mut Connection, record: audit::Record, message: String) {
+    record_refusal_with(app.audit, db, record, message)
+}
+fn record_refusal_with(
+    retention: audit::Retention,
+    db: &mut Connection,
+    mut record: audit::Record,
+    message: String,
+) {
     count(&guard_core::metrics::METRICS.admin_changes[1]);
     if record.action == "rules.replace" && !message.starts_with("rules revision conflict") {
         count(&guard_core::metrics::METRICS.rules_compile_failures[1]);
@@ -387,7 +436,7 @@ fn record_refusal(app: &App, db: &mut Connection, mut record: audit::Record, mes
     record.result = audit::Outcome::Refused;
     record.summary = format!("refused: {message}");
     record.error = Some(message);
-    if let Err(e) = audit::insert_alone(db, app.audit, &record) {
+    if let Err(e) = audit::insert_alone(db, retention, &record) {
         eprintln!("audit refusal record failed: {e}");
     }
 }
@@ -1225,6 +1274,17 @@ fn router(app: App) -> Router {
         .route("/v1/reasons", get(explain::reasons))
         .route("/v1/rules/document", get(rules_document_get))
         .route(
+            "/v1/asn/bundle",
+            get(asn::bundle_get)
+                .put(asn::bundle_put)
+                .layer(DefaultBodyLimit::max(asn::MAX_BUNDLE_BYTES)),
+        )
+        .route("/v1/asn/bundle/rollback", post(asn::bundle_rollback))
+        .route("/v1/asn/refresh", post(asn::refresh))
+        .route("/v1/asn/preview", post(asn::preview))
+        .route("/v1/asn/proposals", get(asn::list).post(asn::create))
+        .route("/v1/asn/proposals/{id}", get(asn::get).post(asn::act))
+        .route(
             "/v1/zones",
             get(console_api::zones_get)
                 .post(console_api::zones_change)
@@ -1322,6 +1382,7 @@ fn router(app: App) -> Router {
                                         | "/v1/history/query"
                                         | "/v1/asn/catalog/query"
                                         | "/v1/zones/lookup"
+                                        | "/v1/asn/preview"
                                 )))
                     {
                         if let Some(action) = action_for(request.method(), path)
@@ -1435,6 +1496,10 @@ fn action_for(method: &axum::http::Method, path: &str) -> Option<&'static str> {
         (&Method::DELETE, "/v1/allowlist") => "allowlist.remove",
         (&Method::POST, "/v1/zones") => "zones.change",
         (&Method::DELETE, "/v1/zones") => "zones.remove",
+        (&Method::PUT, "/v1/asn/bundle") => "asn.bundle.install",
+        (&Method::POST, "/v1/asn/bundle/rollback") => "asn.bundle.rollback",
+        (&Method::POST, "/v1/asn/refresh") => "asn.bundle.install",
+        (&Method::POST, "/v1/asn/proposals") => "asn.proposal.create",
         _ => return None,
     })
 }
@@ -1443,6 +1508,7 @@ fn action_target(action: &str) -> &'static str {
         Some("policy") => "policy",
         Some("allowlist") => "allowlist",
         Some("zones") => "zones",
+        Some("asn") => "asn",
         Some("blocks") | Some("candidates") => "blocks",
         Some("rules") => "rules",
         Some("geoip") => "geoip",
@@ -1495,6 +1561,7 @@ fn open_database(path: &std::path::Path) -> anyhow::Result<Connection> {
     db.busy_timeout(std::time::Duration::from_secs(5))?;
     db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS checkpoint(id INTEGER PRIMARY KEY CHECK(id=1), body TEXT NOT NULL);")?;
     audit::init(&db)?;
+    db.execute_batch(asn::SCHEMA)?;
     Ok(db)
 }
 
@@ -1727,6 +1794,20 @@ fn worker_arguments() -> Vec<std::ffi::OsString> {
 }
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    if let Some(file) = &args.import_asn_bundle {
+        println!(
+            "{}",
+            asn::import_offline(
+                &args.database,
+                file,
+                audit::Retention {
+                    max_rows: args.audit_max_rows,
+                    max_days: args.audit_retention_days
+                }
+            )?
+        );
+        return Ok(());
+    }
     if let Some(path) = &args.evaluate_kubernetes_policy {
         println!(
             "{}",
@@ -1898,6 +1979,12 @@ async fn run(args: Args) -> anyhow::Result<()> {
     if let Some(path) = args.asn_catalog {
         engine.set_asn_catalog(serde_json::from_slice(&std::fs::read(path)?)?)?;
     }
+    let asn_key = asn::key_from_env()?;
+    if args.kubernetes_authority.is_none()
+        && let Some(version) = asn::load_installed(&db, &mut engine, asn_key.as_ref())?
+    {
+        eprintln!("asn: installed signed prefix bundle version {version} loaded");
+    }
     // Startup configuration files that change stored policy are audited with
     // the checkpoint that makes them durable.
     let startup_record = startup_before.and_then(|before| {
@@ -1944,6 +2031,13 @@ async fn run(args: Args) -> anyhow::Result<()> {
         tls: tls_reloader.clone(),
         checkpoint_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         metrics_token,
+        asn: asn::AsnState::new(
+            asn_key.clone(),
+            args.asn_bundle_url.clone(),
+            args.asn_bundle_ca.clone(),
+            args.asn_bundle_interval_seconds,
+            args.asn_proposal_approvals,
+        ),
         native_source,
         network_source: Arc::new(arc_swap::ArcSwapOption::empty()),
         network_source_phase: Arc::new(std::sync::atomic::AtomicU8::new(0)),
@@ -2057,6 +2151,13 @@ async fn run(args: Args) -> anyhow::Result<()> {
     } else {
         None
     };
+    if app.asn.url.is_some() {
+        anyhow::ensure!(
+            app.asn.key.is_some(),
+            "--asn-bundle-url requires HANGANG_GUARD_ASN_BUNDLE_KEY"
+        );
+        tokio::spawn(asn::follow(app.clone(), stop_rx.clone()));
+    }
     if let Some(reloader) = tls_reloader.clone()
         && args.tls_reload_seconds > 0
     {
@@ -2070,7 +2171,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let worker = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
         loop {
-            tokio::select! {_ = interval.tick()=>{let a=checkpoint_app.clone();if let Err(e)=checkpoint(a).await {eprintln!("checkpoint failed: {e}");} console_api::prune_expired_allow(checkpoint_app.clone()).await;}, _=stop_rx.changed()=>break}
+            tokio::select! {_ = interval.tick()=>{let a=checkpoint_app.clone();if let Err(e)=checkpoint(a).await {eprintln!("checkpoint failed: {e}");} console_api::prune_expired_allow(checkpoint_app.clone()).await; let a=checkpoint_app.clone(); let _=tokio::task::spawn_blocking(move || asn::expire_due(&a)).await;}, _=stop_rx.changed()=>break}
         }
     });
     let listener = if args.serve_child {
@@ -2196,6 +2297,7 @@ mod tests {
         db.execute_batch("CREATE TABLE checkpoint(id INTEGER PRIMARY KEY,body TEXT NOT NULL)")
             .unwrap();
         audit::init(&db).unwrap();
+        db.execute_batch(asn::SCHEMA).unwrap();
         App {
             audit: audit::Retention::default(),
             nonces: actor::Nonces::default(),
@@ -2203,6 +2305,7 @@ mod tests {
             tls: None,
             checkpoint_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             metrics_token: Some(Arc::new("metrics-test-token".into())),
+            asn: asn::AsnState::disabled(),
             native_source: None,
             network_source: Arc::new(arc_swap::ArcSwapOption::empty()),
             network_source_phase: Arc::new(std::sync::atomic::AtomicU8::new(0)),

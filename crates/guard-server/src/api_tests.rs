@@ -2048,3 +2048,756 @@ async fn metrics_endpoint_is_authorized_bounded_and_counts_decisions() {
     }
     assert_eq!(scrape(&a, Some(ADMIN)).await.0, StatusCode::OK);
 }
+
+// ----- ASN bundles and proposals -----
+
+fn bundle_key() -> (ed25519_dalek::SigningKey, guard_update::update::TrustKey) {
+    use base64::Engine as _;
+    let key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+    let trust = guard_update::update::TrustKey::from_base64(
+        &base64::engine::general_purpose::STANDARD.encode(key.verifying_key().to_bytes()),
+    )
+    .unwrap();
+    (key, trust)
+}
+fn bundle(key: &ed25519_dalek::SigningKey, version: u64, prefixes: &[(&str, u32)]) -> Vec<u8> {
+    let payload = json!({"format":"sumunjang.asn-bundle.v1","version":version,"created_at":crate::now(),
+        "source":"test-provider","provenance":{"dataset":"fixture"},
+        "prefixes": prefixes.iter().map(|(n,a)| json!({"network":n,"asn":a})).collect::<Vec<_>>()});
+    guard_update::signed_bundle::sign(
+        crate::asn::BUNDLE_DOMAIN,
+        payload.to_string().as_bytes(),
+        key,
+        1 << 24,
+    )
+    .unwrap()
+}
+async fn put_bundle(a: &App, body: Vec<u8>) -> Reply {
+    let r = crate::router(a.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/v1/asn/bundle")
+                .method("PUT")
+                .header("authorization", format!("Bearer {ADMIN}"))
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = r.status();
+    let bytes = axum::body::to_bytes(r.into_body(), 1 << 22).await.unwrap();
+    Reply {
+        status,
+        body: serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        audit_id: None,
+    }
+}
+fn asn_app() -> (App, ed25519_dalek::SigningKey) {
+    let (key, trust) = bundle_key();
+    let mut a = app();
+    a.asn = crate::asn::AsnState::new(Some(trust), None, None, 3600, 1);
+    (a, key)
+}
+
+#[tokio::test]
+async fn signed_asn_bundles_install_diff_refuse_downgrade_and_roll_back() {
+    let (a, key) = asn_app();
+    let v1 = bundle(
+        &key,
+        1,
+        &[("198.51.100.0/24", 64500), ("203.0.113.0/24", 64500)],
+    );
+    let r = put_bundle(&a, v1.clone()).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(
+        (r.body["changed"].clone(), r.body["diff"]["added"].clone()),
+        (json!(true), json!(2))
+    );
+    assert_eq!(a.inner.lock().unwrap().engine.asn_catalog().len(), 2);
+    assert_eq!(put_bundle(&a, v1).await.body["changed"], false);
+    // Tampered, wrong key and downgrade are refused.
+    let mut env: Value = serde_json::from_slice(&bundle(&key, 5, &[("192.0.2.0/24", 1)])).unwrap();
+    env["signature"] = json!(base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        [0u8; 64]
+    ));
+    assert_eq!(
+        put_bundle(&a, serde_json::to_vec(&env).unwrap())
+            .await
+            .status,
+        StatusCode::BAD_REQUEST
+    );
+    let other = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+    assert_eq!(
+        put_bundle(&a, bundle(&other, 6, &[("192.0.2.0/24", 1)]))
+            .await
+            .status,
+        StatusCode::BAD_REQUEST
+    );
+    let r = put_bundle(
+        &a,
+        bundle(
+            &key,
+            2,
+            &[("198.51.100.0/24", 64501), ("2001:db8::/32", 64500)],
+        ),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(
+        (
+            r.body["diff"]["added"].clone(),
+            r.body["diff"]["removed"].clone(),
+            r.body["diff"]["reassigned"].clone()
+        ),
+        (json!(1), json!(1), json!(1))
+    );
+    assert_eq!(
+        put_bundle(&a, bundle(&key, 1, &[("192.0.2.0/24", 1)]))
+            .await
+            .status,
+        StatusCode::CONFLICT
+    );
+    // Rollback to last-good v1 (CAS on the installed version).
+    assert_eq!(
+        call(
+            &a,
+            "POST",
+            "/v1/asn/bundle/rollback",
+            ADMIN,
+            Some(json!({"expected_version":1,"reason":"bad data"}))
+        )
+        .await
+        .status,
+        StatusCode::CONFLICT
+    );
+    let r = call(
+        &a,
+        "POST",
+        "/v1/asn/bundle/rollback",
+        ADMIN,
+        Some(json!({"expected_version":2,"reason":"bad data"})),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(r.body["version"], 1);
+    assert_eq!(
+        a.inner
+            .lock()
+            .unwrap()
+            .engine
+            .asn_catalog()
+            .iter()
+            .filter(|p| p.asn == 64500)
+            .count(),
+        2
+    );
+    // The rolled-back version cannot come back; a newer one can.
+    assert_eq!(
+        put_bundle(&a, bundle(&key, 2, &[("192.0.2.0/24", 1)]))
+            .await
+            .status,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        put_bundle(&a, bundle(&key, 3, &[("192.0.2.0/24", 7)]))
+            .await
+            .status,
+        StatusCode::OK
+    );
+    let g = call(&a, "GET", "/v1/asn/bundle", ADMIN, None).await.body;
+    assert_eq!(g["current"]["version"], 3);
+    assert_eq!(g["current"]["source"], "test-provider");
+    let states: Vec<_> = g["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| {
+            (
+                h["version"].as_u64().unwrap(),
+                h["state"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        states,
+        [(2, "rolled_back".to_owned()), (1, "previous".to_owned())]
+    );
+    let actions: Vec<_> = entries(&a, "?action=asn.*&limit=200")
+        .await
+        .iter()
+        .filter(|e| e["result"] == "committed")
+        .map(|e| e["action"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        actions,
+        [
+            "asn.bundle.install",
+            "asn.bundle.rollback",
+            "asn.bundle.install",
+            "asn.bundle.install"
+        ]
+    );
+    // The installed bundle survives restart from the database.
+    {
+        let db = a.db.lock().unwrap();
+        let mut fresh = guard_core::Engine::new(guard_core::Policy::default()).unwrap();
+        assert_eq!(
+            crate::asn::load_installed(&db, &mut fresh, None).unwrap(),
+            Some(3)
+        );
+        assert_eq!(fresh.asn_catalog()[0].asn, 7);
+    }
+    // Refresh without a configured URL is refused.
+    assert_eq!(
+        call(&a, "POST", "/v1/asn/refresh", ADMIN, Some(json!({})))
+            .await
+            .status,
+        StatusCode::CONFLICT
+    );
+    let (b, _) = (app(), ());
+    assert_eq!(
+        put_bundle(&b, bundle(&key, 1, &[("192.0.2.0/24", 1)]))
+            .await
+            .status,
+        StatusCode::CONFLICT,
+        "no key configured"
+    );
+}
+
+async fn proposal_fixture() -> App {
+    let (a, key) = asn_app();
+    put_bundle(
+        &a,
+        bundle(
+            &key,
+            1,
+            &[
+                ("198.51.100.0/24", 64500),
+                ("203.0.113.0/24", 64500),
+                ("2001:db8::/32", 64501),
+            ],
+        ),
+    )
+    .await;
+    put_document(&a, json!({"mode":"enforce","allow":["203.0.113.128/25"]})).await;
+    upsert_zone(&a, json!({"id":"partner","prefixes":["198.51.100.0/25"]})).await;
+    events(&a, "198.51.100.7", &["honeypot"]).await;
+    events(&a, "203.0.113.9", &["scanner"]).await;
+    a
+}
+async fn act(a: &App, id: &str, body: Value, headers: &[(&str, String)]) -> Reply {
+    call_with(
+        a,
+        "POST",
+        &format!("/v1/asn/proposals/{id}"),
+        ADMIN,
+        Some(body),
+        headers,
+    )
+    .await
+}
+fn delegated(path: &str, body: &Value, ts_offset: u64) -> Vec<(&'static str, String)> {
+    let (assertion, mac) = actor::sign_for_test(
+        ADMIN.as_bytes(),
+        "POST",
+        path,
+        body.to_string().as_bytes(),
+        crate::now() + ts_offset,
+    );
+    vec![
+        ("x-hopae-delegation", assertion),
+        ("x-hopae-delegation-mac", mac),
+    ]
+}
+
+#[tokio::test]
+async fn asn_proposal_preview_and_scopes_report_impact_and_collisions() {
+    let a = proposal_fixture().await;
+    let r = call(
+        &a,
+        "POST",
+        "/v1/asn/preview",
+        ADMIN,
+        Some(json!({"asn":64500,"scope":{"kind":"asn"}})),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let i = &r.body["impact"];
+    assert_eq!(r.body["stored"], false);
+    assert_eq!(i["networks"], 2);
+    assert_eq!(i["estimated"]["ipv4_addresses"], 512);
+    assert_eq!(i["tracked"]["addresses"], 2);
+    assert_eq!(
+        i["preview"]["enforce"]["allow_to_deny"], 2,
+        "both tracked addresses would be denied in enforce"
+    );
+    assert_eq!(i["collisions"]["allowlist"][0]["allow"], "203.0.113.128/25");
+    assert_eq!(i["collisions"]["zones"][0]["zone"], "partner");
+    assert!(i["warnings"].as_array().unwrap().len() >= 2);
+    let agg = call(
+        &a,
+        "POST",
+        "/v1/asn/preview",
+        ADMIN,
+        Some(json!({"asn":64500,"scope":{"kind":"aggregates"}})),
+    )
+    .await
+    .body;
+    assert_eq!(
+        agg["impact"]["network_list"],
+        json!(["198.51.100.0/24", "203.0.113.0/24"])
+    );
+    let bad = call(&a, "POST", "/v1/asn/preview", ADMIN, Some(json!({"asn":64500,"scope":{"kind":"prefixes","prefixes":["192.0.2.0/24","203.0.113.0/26"]}}))).await;
+    assert_eq!(bad.status, StatusCode::BAD_REQUEST);
+    assert_eq!(bad.body["errors"][0]["path"], "/scope/prefixes/0");
+    assert_eq!(
+        call(
+            &a,
+            "POST",
+            "/v1/asn/preview",
+            ADMIN,
+            Some(json!({"asn":1,"scope":{"kind":"asn"}}))
+        )
+        .await
+        .body["errors"][0]["path"],
+        "/asn"
+    );
+    let ok = call(
+        &a,
+        "POST",
+        "/v1/asn/preview",
+        ADMIN,
+        Some(json!({"asn":64500,"scope":{"kind":"prefixes","prefixes":["203.0.113.0/26"]}})),
+    )
+    .await;
+    assert_eq!(ok.body["impact"]["networks"], 1);
+    // Preview stores nothing and changes no decision.
+    assert_eq!(
+        call(&a, "GET", "/v1/asn/proposals", ADMIN, None).await.body["proposals"],
+        json!([])
+    );
+    assert_eq!(
+        a.view
+            .load()
+            .query_ip("198.51.100.7".parse().unwrap(), crate::now())
+            .action,
+        "allow"
+    );
+}
+
+#[tokio::test]
+async fn asn_proposal_lifecycle_two_person_rule_activation_and_withdrawal() {
+    let a = proposal_fixture().await;
+    let create = json!({"asn":64500,"scope":{"kind":"asn"},"reason":"botnet C2 hosting","expires_at":crate::now()+3*86400});
+    let headers = delegated("/v1/asn/proposals", &create, 0);
+    let r = call_with(
+        &a,
+        "POST",
+        "/v1/asn/proposals",
+        ADMIN,
+        Some(create),
+        &headers,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let id = r.body["id"].as_str().unwrap().to_owned();
+    assert!(
+        id.starts_with("p-")
+            && id.len() == 22
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    );
+    assert_eq!(
+        (
+            r.body["state"].clone(),
+            r.body["created_by"]["name"].clone()
+        ),
+        (json!("draft"), json!("operator"))
+    );
+    assert_eq!(
+        call(
+            &a,
+            "POST",
+            "/v1/asn/proposals",
+            ADMIN,
+            Some(json!({"asn":64500,"scope":{"kind":"asn"}}))
+        )
+        .await
+        .body["errors"][0]["path"],
+        "/reason"
+    );
+    // Approve before submit, stale revision, unknown action.
+    assert_eq!(
+        act(
+            &a,
+            &id,
+            json!({"action":"approve","expected_revision":1}),
+            &[]
+        )
+        .await
+        .status,
+        StatusCode::CONFLICT
+    );
+    let stale = act(
+        &a,
+        &id,
+        json!({"action":"submit","expected_revision":9}),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        (stale.status, stale.body["current_revision"].clone()),
+        (StatusCode::CONFLICT, json!(1))
+    );
+    let r = act(
+        &a,
+        &id,
+        json!({"action":"submit","expected_revision":1}),
+        &[],
+    )
+    .await;
+    assert_eq!(r.body["state"], "pending");
+    // Two-person rule: the delegated proposer cannot approve.
+    let body = json!({"action":"approve","expected_revision":2,"reason":"self"});
+    let path = format!("/v1/asn/proposals/{id}");
+    let own = act(&a, &id, body.clone(), &delegated(&path, &body, 1)).await;
+    assert_eq!(own.status, StatusCode::CONFLICT);
+    assert!(own.body["error"].as_str().unwrap().contains("two-person"));
+    let r = act(&a, &id, json!({"action":"annotate","expected_revision":2,"decision_log":{"requests":1200,"denied":40,"distinct_ip_refs":17}}), &[]).await;
+    assert_eq!(r.body["decision_log"]["counts"]["requests"], 1200);
+    let r = act(
+        &a,
+        &id,
+        json!({"action":"approve","expected_revision":3,"reason":"reviewed"}),
+        &[],
+    )
+    .await;
+    assert_eq!(r.body["state"], "approved");
+    // Approval alone never blocks.
+    assert_eq!(
+        a.view
+            .load()
+            .query_ip("198.51.100.7".parse().unwrap(), crate::now())
+            .action,
+        "allow"
+    );
+    let r = act(
+        &a,
+        &id,
+        json!({"action":"activate","expected_revision":4,"reason":"go"}),
+        &[],
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(r.body["state"], "active");
+    assert_eq!(r.body["activation"]["blocked"].as_array().unwrap().len(), 2);
+    let view = a.view.load_full();
+    let d = view.query_ip("198.51.100.7".parse().unwrap(), crate::now());
+    assert_eq!(
+        (d.action, d.code.as_str()),
+        ("deny", "sumunjang.deny.block_asn")
+    );
+    assert_eq!(
+        a.view
+            .load()
+            .query_ip("203.0.113.200".parse().unwrap(), crate::now())
+            .action,
+        "allow",
+        "allowlist wins"
+    );
+    let blocks = call(&a, "GET", "/v1/blocks", ADMIN, None).await.body;
+    assert!(
+        blocks
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|b| b["source"] == "asn_proposal")
+    );
+    // Withdraw removes exactly this proposal's blocks.
+    let r = act(
+        &a,
+        &id,
+        json!({"action":"withdraw","expected_revision":5,"reason":"false positive"}),
+        &[],
+    )
+    .await;
+    assert_eq!(r.body["state"], "withdrawn");
+    assert_eq!(
+        a.view
+            .load()
+            .query_ip("198.51.100.7".parse().unwrap(), crate::now())
+            .action,
+        "allow"
+    );
+    assert_eq!(
+        call(&a, "GET", "/v1/blocks", ADMIN, None).await.body,
+        json!([])
+    );
+    assert_eq!(
+        act(
+            &a,
+            &id,
+            json!({"action":"activate","expected_revision":6}),
+            &[]
+        )
+        .await
+        .status,
+        StatusCode::CONFLICT
+    );
+    let detail = call(&a, "GET", &format!("/v1/asn/proposals/{id}"), ADMIN, None)
+        .await
+        .body;
+    let steps: Vec<_> = detail["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["action"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        steps,
+        [
+            "create", "submit", "annotate", "approve", "activate", "withdraw"
+        ]
+    );
+    let audited: Vec<_> = entries(&a, "?action=asn.proposal.*&limit=200")
+        .await
+        .iter()
+        .filter(|e| e["result"] == "committed")
+        .map(|e| e["action"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        audited,
+        [
+            "asn.proposal.withdraw",
+            "asn.proposal.activate",
+            "asn.proposal.approve",
+            "asn.proposal.annotate",
+            "asn.proposal.submit",
+            "asn.proposal.create"
+        ]
+    );
+    assert_eq!(
+        call(&a, "GET", "/v1/asn/proposals/p-unknown", ADMIN, None)
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn asn_proposals_reject_and_expire() {
+    let a = proposal_fixture().await;
+    let r = call(
+        &a,
+        "POST",
+        "/v1/asn/proposals",
+        ADMIN,
+        Some(json!({"asn":64501,"scope":{"kind":"asn"},"reason":"test"})),
+    )
+    .await;
+    let id = r.body["id"].as_str().unwrap().to_owned();
+    act(
+        &a,
+        &id,
+        json!({"action":"submit","expected_revision":1}),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        act(
+            &a,
+            &id,
+            json!({"action":"reject","expected_revision":2}),
+            &[]
+        )
+        .await
+        .status,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        act(
+            &a,
+            &id,
+            json!({"action":"reject","expected_revision":2,"reason":"too broad"}),
+            &[]
+        )
+        .await
+        .body["state"],
+        "rejected"
+    );
+    let r = call(
+        &a,
+        "POST",
+        "/v1/asn/proposals",
+        ADMIN,
+        Some(json!({"asn":64501,"scope":{"kind":"asn"},"reason":"expiring"})),
+    )
+    .await;
+    let id2 = r.body["id"].as_str().unwrap().to_owned();
+    {
+        let db = a.db.lock().unwrap();
+        let body: String = db
+            .query_row("SELECT body FROM asn_proposals WHERE id=?1", [&id2], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let mut p: Value = serde_json::from_str(&body).unwrap();
+        p["expires_at"] = json!(crate::now() - 1);
+        db.execute(
+            "UPDATE asn_proposals SET body=?2 WHERE id=?1",
+            rusqlite::params![id2, p.to_string()],
+        )
+        .unwrap();
+    }
+    crate::asn::expire_due(&a);
+    let list = call(&a, "GET", "/v1/asn/proposals", ADMIN, None).await.body;
+    let states: Vec<_> = list["proposals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["state"].as_str().unwrap().to_owned())
+        .collect();
+    let mut states = states;
+    states.sort();
+    assert_eq!(states, ["expired", "rejected"]);
+    assert_eq!(
+        entries(&a, "?action=asn.proposal.expire").await[0]["actor"]["kind"],
+        "system"
+    );
+}
+
+#[tokio::test]
+async fn asn_bundle_fetch_over_https_and_offline_import() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (key, trust) = bundle_key();
+    let pki = crate::tls_reload::tests::Pki::new();
+    // Minimal HTTPS origin (server cert only) serving version 4 then version 4 again.
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let certs: Vec<_> =
+        rustls_pemfile::certs(&mut std::fs::read(pki.path("server.pem")).unwrap().as_slice())
+            .collect::<Result<_, _>>()
+            .unwrap();
+    let key_der =
+        rustls_pemfile::private_key(&mut std::fs::read(pki.path("server.key")).unwrap().as_slice())
+            .unwrap()
+            .unwrap();
+    let config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(certs, key_der)
+        .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let body = bundle(&key, 4, &[("192.0.2.0/24", 64496)]);
+    let server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(socket).await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = tls.read(&mut buf).await.unwrap();
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            tls.write_all(head.as_bytes()).await.unwrap();
+            tls.write_all(&body).await.unwrap();
+            tls.shutdown().await.unwrap();
+        }
+    });
+    let mut a = app();
+    a.asn = crate::asn::AsnState::new(
+        Some(trust),
+        Some(format!("https://localhost:{port}/asn.json")),
+        Some(pki.path("ca.pem")),
+        3600,
+        1,
+    );
+    let r = call(&a, "POST", "/v1/asn/refresh", ADMIN, Some(json!({}))).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(
+        (r.body["version"].clone(), r.body["diff"]["added"].clone()),
+        (json!(4), json!(1))
+    );
+    let again = crate::asn::fetch_once(&a, crate::actor::Actor::system())
+        .await
+        .unwrap();
+    assert_eq!(again["changed"], false);
+    server.await.unwrap();
+    let status = call(&a, "GET", "/v1/asn/bundle", ADMIN, None).await.body;
+    assert_eq!(status["fetch"]["status"]["attempts"], 2);
+    assert_eq!(status["fetch"]["status"]["last_version"], 4);
+    // Unreachable origin: failure recorded, catalog unchanged.
+    a.asn = crate::asn::AsnState::new(
+        a.asn.key.clone(),
+        Some("https://127.0.0.1:1/x".into()),
+        None,
+        3600,
+        1,
+    );
+    assert!(
+        crate::asn::fetch_once(&a, crate::actor::Actor::system())
+            .await
+            .is_err()
+    );
+    assert_eq!(a.inner.lock().unwrap().engine.asn_catalog().len(), 1);
+    // Plain HTTP URLs are refused (https only).
+    a.asn = crate::asn::AsnState::new(
+        a.asn.key.clone(),
+        Some("http://127.0.0.1:1/x".into()),
+        None,
+        3600,
+        1,
+    );
+    assert!(
+        crate::asn::fetch_once(&a, crate::actor::Actor::system())
+            .await
+            .is_err()
+    );
+
+    // Offline import into a database file.
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("guard.sqlite3");
+    {
+        let mut db = crate::open_database(&database).unwrap();
+        crate::persist_state(
+            &mut db,
+            &guard_core::Engine::new(guard_core::Policy::default())
+                .unwrap()
+                .state(),
+        )
+        .unwrap();
+    }
+    let file = dir.path().join("bundle.json");
+    std::fs::write(&file, bundle(&key, 9, &[("198.51.100.0/24", 64500)])).unwrap();
+    use base64::Engine as _;
+    // SAFETY: test-only environment variable read by import_offline.
+    unsafe {
+        std::env::set_var(
+            "HANGANG_GUARD_ASN_BUNDLE_KEY",
+            base64::engine::general_purpose::STANDARD.encode(key.verifying_key().to_bytes()),
+        )
+    };
+    let report: Value = serde_json::from_str(
+        &crate::asn::import_offline(&database, &file, audit::Retention::default()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(report["version"], 9);
+    let db = crate::open_database(&database).unwrap();
+    let mut e = guard_core::Engine::new(guard_core::Policy::default()).unwrap();
+    assert_eq!(
+        crate::asn::load_installed(&db, &mut e, None).unwrap(),
+        Some(9)
+    );
+    let audited: String = db
+        .query_row(
+            "SELECT action FROM audit ORDER BY seq DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(audited, "asn.bundle.install");
+}

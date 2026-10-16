@@ -197,9 +197,10 @@ pub enum ReasonCode {
     DenyBlockApproved,
     DenyBlockAutomatic,
     DenyBlockSource,
+    DenyBlockAsn,
 }
 impl ReasonCode {
-    pub const ALL: [ReasonCode; 9] = [
+    pub const ALL: [ReasonCode; 10] = [
         Self::ObserveMode,
         Self::AllowAllowlist,
         Self::AllowRule,
@@ -209,6 +210,7 @@ impl ReasonCode {
         Self::DenyBlockApproved,
         Self::DenyBlockAutomatic,
         Self::DenyBlockSource,
+        Self::DenyBlockAsn,
     ];
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -221,6 +223,7 @@ impl ReasonCode {
             Self::DenyBlockApproved => "sumunjang.deny.block_approved",
             Self::DenyBlockAutomatic => "sumunjang.deny.block_automatic",
             Self::DenyBlockSource => "sumunjang.deny.block_source",
+            Self::DenyBlockAsn => "sumunjang.deny.block_asn",
         }
     }
     pub fn classify(stage: DecidingStage, rule: Option<&Rule>, block: Option<&Block>) -> Self {
@@ -240,6 +243,7 @@ impl ReasonCode {
                 Some((BlockSource::Approved, _))
                 | Some((BlockSource::Unknown, APPROVED_BLOCK_REASON)) => Self::DenyBlockApproved,
                 Some((BlockSource::Kubernetes, _)) => Self::DenyBlockSource,
+                Some((BlockSource::AsnProposal, _)) => Self::DenyBlockAsn,
                 _ => Self::DenyBlockManual,
             },
         }

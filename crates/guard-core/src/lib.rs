@@ -78,6 +78,8 @@ pub enum BlockSource {
     Auto,
     /// Native Kubernetes policy source.
     Kubernetes,
+    /// Activated, reviewed ASN block proposal.
+    AsnProposal,
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1363,6 +1365,15 @@ impl DecisionView {
         };
         let m = self.rules.matching(ip, now, geo);
         (m.score, self.rules.matching_ids(&m))
+    }
+    /// A never-published view with additional blocks (proposal previews).
+    pub fn with_blocks(&self, blocks: &[Block]) -> Result<Self> {
+        let mut view = self.clone();
+        for b in blocks {
+            view.blocks
+                .insert(canonical_network(&b.network)?, Arc::new(b.clone()));
+        }
+        Ok(view)
     }
     /// Rule set compiled into this view, in precedence order.
     pub fn compiled_rules(&self) -> &[Rule] {

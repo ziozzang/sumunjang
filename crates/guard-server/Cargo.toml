@@ -52,3 +52,4 @@ rustls-pemfile = "2"
 rcgen = "0.14"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+ed25519-dalek = "2"

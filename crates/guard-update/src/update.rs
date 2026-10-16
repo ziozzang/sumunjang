@@ -64,6 +64,9 @@ impl TrustKey {
         );
         Ok(Self(key))
     }
+    pub fn verifying_key(&self) -> &VerifyingKey {
+        &self.0
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

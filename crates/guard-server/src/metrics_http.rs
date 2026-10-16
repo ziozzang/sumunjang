@@ -76,13 +76,20 @@ pub fn render(app: &App) -> String {
             out,
             "# HELP sumunjang_blocks Active blocks by provenance.\n# TYPE sumunjang_blocks gauge"
         );
-        let mut by_source = [0usize; 5];
+        let mut by_source = [0usize; 6];
         for b in e.blocks() {
             by_source[b.origin.source as usize] += 1;
         }
-        for (i, source) in ["unknown", "manual", "approved", "auto", "kubernetes"]
-            .iter()
-            .enumerate()
+        for (i, source) in [
+            "unknown",
+            "manual",
+            "approved",
+            "auto",
+            "kubernetes",
+            "asn_proposal",
+        ]
+        .iter()
+        .enumerate()
         {
             let _ = writeln!(
                 out,
