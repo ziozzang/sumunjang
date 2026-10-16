@@ -23,6 +23,7 @@ TODO는 저장소 루트에 둡니다. Guard는 제로트러스트 백본의 IP/
 | 네트워크 존 | [네트워크 존](NETWORK_ZONES.md) | [Zones](../NETWORK_ZONES.md) |
 | 지표 | [지표](METRICS.md) | [Metrics](../METRICS.md) |
 | ASN 번들과 제안 | [ASN](ASN_PROPOSALS.md) | [ASN](../ASN_PROPOSALS.md) |
+| LLM 검사 설계(제안) | [LLM 검사](LLM_INSPECTION.md) | [LLM inspection](../LLM_INSPECTION.md) |
 | 향후 작업 | [TODO](../../TODO.ko.md) | [TODO](../../TODO.md) |
 
 [Hangang 콘솔 통합](CONSOLE.md)

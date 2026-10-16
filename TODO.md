@@ -46,6 +46,11 @@ not every decision; do not retain all request logs. The original working name
 User-requested investigation: inspect request patterns according to operator
 prompts and use LLM queries for analysis. Decide implementation after design.
 
+Design (proposed, 2026-10-17): [docs/LLM_INSPECTION.md](docs/LLM_INSPECTION.md)
+covers every item below — asynchronous aggregate analysis only, advisory
+annotations, Dorang OpenAI-compatible backend, phases L0–L4. Items stay open
+until the corresponding phase is implemented and qualified.
+
 - [ ] Design prompt policies defining inspection goals, criteria and output schemas.
 - [ ] Compare synchronous per-request queries with asynchronous aggregate analysis:
       latency, cost, throughput, failure behavior, and interaction between optional

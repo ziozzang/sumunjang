@@ -23,6 +23,7 @@ Hopae owns users/principals. Guard decisions do not replace authentication.
 | Network zones | [Zones](NETWORK_ZONES.md) | [네트워크 존](ko/NETWORK_ZONES.md) |
 | Metrics | [Metrics](METRICS.md) | [지표](ko/METRICS.md) |
 | ASN bundles and proposals | [ASN](ASN_PROPOSALS.md) | [ASN](ko/ASN_PROPOSALS.md) |
+| LLM inspection design (proposed) | [LLM inspection](LLM_INSPECTION.md) | [LLM 검사](ko/LLM_INSPECTION.md) |
 | Backlog | [TODO](../TODO.md) | [TODO](../TODO.ko.md) |
 
 [Hangang console integration](CONSOLE.md)
