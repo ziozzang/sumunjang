@@ -64,3 +64,6 @@ Check는 판정 전에 정확한 불변 정책 view와 필요한 경우 GeoIP �
 존 근거: `NetworkEvidence.zone_ids`(10), `zone_ids_truncated`(11),
 `zone_revision`(12)은 주소를 포함하는 네트워크 존을 나열한다(최대 8개, 1KiB 인코딩
 한계에 맞게 줄임). [네트워크 존](NETWORK_ZONES.md) 참고.
+
+TLS 자료는 재시작 없이 재적재된다. gRPC TLS는 같은 한도로 tonic 앞에서 수문장이
+종료한다. [운영](OPERATIONS.md) 참고.

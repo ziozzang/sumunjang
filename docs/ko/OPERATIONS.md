@@ -79,3 +79,37 @@ Dynamic RuleSet은 snapshot v1로 전송하지 않으므로 query mode를 사용
 ## 관리 mTLS
 
 `--management-tls`는 판정 TLS 인증서·키·CA로 관리 리스너에 필수 클라이언트 인증서 HTTPS를 제공합니다. 판정 TLS 설정과 네이티브 리스너도 필요합니다. 수집자/관리자 토큰 역할은 계속 검사하며 인증서만으로 정책 쓰기를 허용하지 않습니다. 공용 HTTP/1.1 런타임이 연결·핸드셰이크·헤더·종료 시간을 제한합니다. 감독 실행 HUP에서도 리스너를 인계합니다. 명시적인 루프백 배포의 평문 관리는 유지하며 원격 Service로 노출하지 않습니다.
+
+## TLS 인증서 교체(무중단 재적재)와 프로브
+
+판정 TLS 자료(`--decision-tls-cert`, `--decision-tls-key`, `--decision-client-ca`)는
+HGD1 mTLS 리스너, gRPC 리스너, `--management-tls` 사용 시 관리 HTTPS 리스너에 쓰인다.
+수문장은 세 파일을 `--tls-reload-seconds`(기본 10, 0이면 비활성)마다 내용 해시로
+확인한다. inotify를 쓰지 않으므로 cert-manager/kubelet의 Secret 볼륨 갱신(원자적
+`..data` 심볼릭 링크 교체)도 감지한다. 변경되면 파일을 한 번에 읽어 세 리스너의 rustls
+설정을 같은 정책(명시 CA의 클라이언트 인증서 필수, 안전한 프로토콜 버전, early data
+없음, 리스너별 ALPN)으로 새로 만들고 원자적으로 교체한다. 새 핸드셰이크는 새 자료를
+쓰고 기존 연결은 닫힐 때까지 세션을 유지한다(HGD1·관리 연결은 최대 300초). 로그에
+`tls: reloaded certificate material; leaf sha256 <지문>`이 남는다.
+
+잘못된 새 자료(해석 불가 PEM, 인증서와 맞지 않는 키, 빈 CA, 1MiB 초과, 교체 중 파일
+없음)는 거부하고 이전 설정으로 계속 서비스한다. `GET /v1/status`의 `tls`는
+`leaf_sha256`, `loaded_at`, `reloads_total`, `reload_failures_total`,
+`consecutive_failures`, `last_error`, `last_failure_at`을 보고한다.
+`reload_failures_total` 증가나 0이 아닌 `consecutive_failures`에 경보를 설정한다. 같은
+잘못된 자료는 한 번만 기록하고 파일이 다시 바뀔 때 재시도한다.
+
+gRPC TLS는 이제 tonic 앞에서 수문장이 종료한다(핸드셰이크마다 현재 자료, 3초 제한,
+연결 2,048개, ALPN `h2`, 클라이언트 인증서 필수). 기존 HTTP/2 한도는 같다.
+
+외부로 나가는 클라이언트는 이미 사용할 때마다 CA 파일을 다시 읽는다. 네이티브
+Kubernetes 권위는 수집(500ms)마다 `ca` 파일을 읽고, 읽기 전용 정책 원천은 CA 바이트가
+바뀌면 클라이언트를 다시 만들며, 서명 업데이트 확인은 확인마다 `--update-ca`를 읽는다.
+이 CA 파일 교체에는 재시작이 필요 없다.
+
+**프로브.** TCP 프로브 대신 `--readiness-listen IP:port`(일반 HTTP, 프로브 전용, 관리
+경로 없음)에서 준비 상태는 `httpGet /readyz`, 생존은 `/healthz`를 쓴다. `/readyz`는
+네이티브 Kubernetes 원천이 최신이 아니거나 최근 영속 체크포인트가 실패한 동안 503을
+반환한다. 이전 유효 자료로 계속 서비스하므로 TLS 재적재 실패는 준비 상태에 영향을
+주지 않는다. 주 리스너도 같은 `/readyz`를 제공한다.
+`deploy/sumunjang-native-authority-deployment.yaml` 참고.

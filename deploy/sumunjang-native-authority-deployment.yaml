@@ -58,6 +58,12 @@ spec:
           ports:
             - {name: binary-mtls, containerPort: 9081}
             - {name: grpc-mtls, containerPort: 9082}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 9083
+            periodSeconds: 10
+            failureThreshold: 3
           readinessProbe:
             httpGet:
               path: /readyz

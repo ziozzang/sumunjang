@@ -87,3 +87,6 @@ The 24-byte frames above are unchanged. Matched rule IDs, ASN, country and
 reason codes are available only through the additive gRPC
 `include_evidence` flag and HTTP `/v1/decision` `"evidence": true`; see
 [gRPC](GRPC.md) and [audit and explain](AUDIT_EXPLAIN.md).
+
+The native mTLS listener picks up rotated certificate, key and client-CA files
+without restart (`--tls-reload-seconds`); see [operations](OPERATIONS.md).

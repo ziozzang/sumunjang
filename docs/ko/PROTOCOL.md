@@ -79,3 +79,6 @@ membership이나 전체 스택 TLS 처리량이 검증된 것은 아닙니다.
 위 24바이트 프레임은 바뀌지 않는다. 일치 룰 ID·ASN·국가·사유 코드는 추가된 gRPC
 `include_evidence` 플래그와 HTTP `/v1/decision`의 `"evidence": true`로만 제공한다.
 [gRPC](GRPC.md)와 [감사·explain](AUDIT_EXPLAIN.md) 참고.
+
+네이티브 mTLS 리스너는 교체된 인증서·키·클라이언트 CA 파일을 재시작 없이
+반영한다(`--tls-reload-seconds`). [운영](OPERATIONS.md) 참고.

@@ -589,3 +589,16 @@ ADR 0021 P1 전까지 서명 없음), 할당 없는 존 마스크 트리(no_allo
 모두 쓴다. 코어 46·no_alloc 2·서버 82개 테스트와 Clippy가 통과했다. 남은 일: ADR 0022
 NetworkZone/NetworkControl CRD 원천, 서명된 스냅샷 조회(PPG2/HGD), Pumgye 가져오기
 자동화, 브로커 경로 한도(플러그인 계약 v2).
+
+## TLS 무중단 재적재와 HTTP 준비 상태 — 2026-10-17
+
+원격 k3s 검증에서 cert-manager가 갱신한 인증서가 재시작 후에야 적용되는 문제가
+드러났다. 브랜치 `feat/tls-hot-reload`(`feat/network-zones` 기반, 로컬)는 판정 TLS
+인증서/키/CA를 내용 해시로 확인하고(`--tls-reload-seconds`, 기본 10, inotify 없음) 한
+번의 일관된 읽기로 HGD1·gRPC·관리 HTTPS rustls 설정을 다시 만들어 원자적으로 교체한다.
+기존 연결은 세션을 유지한다. 잘못된 자료는 거부하고 이전 인증서로 계속 서비스하며
+`/v1/status`의 `tls`가 지문과 재적재/실패 횟수를 보고한다. gRPC TLS는 이제 tonic 앞에서
+수문장이 종료한다. Kubernetes·업데이트 외부 클라이언트는 이미 CA 파일을 다시 읽는다.
+`/readyz`는 최근 체크포인트 실패 시에도 실패하며 배포 템플릿에 HTTP 생존 프로브를
+추가했다. 서버 86개 테스트(실제 HGD1/gRPC/HTTPS 재적재 핸드셰이크와 tonic mTLS 호출)와
+Clippy가 통과했다. 남은 일: 원격 k3s 교체 검증 재실행, Prometheus 형식 지표 엔드포인트.

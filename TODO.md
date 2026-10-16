@@ -665,3 +665,19 @@ Console package 0.1.7 uses all 32 broker routes. Core 46 + no_alloc 2 and
 server 82 tests and Clippy pass. Open: ADR 0022 NetworkZone/NetworkControl CRD
 source, signed snapshot fetch (PPG2/HGD), Pumgye import automation, broker
 route limit (plugin contract v2).
+
+## TLS hot reload and HTTP readiness — 2026-10-17
+
+Remote k3s qualification showed renewed cert-manager certificates were served
+only after restart. Branch `feat/tls-hot-reload` (on `feat/network-zones`;
+local) polls the decision TLS cert/key/CA by content digest
+(`--tls-reload-seconds`, default 10, no inotify), rebuilds the HGD1, gRPC and
+management HTTPS rustls configurations from one consistent read and swaps them
+atomically; existing connections keep their sessions. Invalid material is
+refused, the old certificate keeps serving and `/v1/status` `tls` exposes
+fingerprint and reload/failure counters. gRPC TLS now terminates in Sumunjang
+before tonic. Outbound Kubernetes/update clients already re-read CA files.
+`/readyz` also fails while the latest checkpoint failed; the deployment template
+adds an HTTP liveness probe. Server 86 tests (real HGD1/gRPC/HTTPS reload
+handshakes and a tonic mTLS call) and Clippy pass. Open: re-run the remote k3s
+rotation qualification; Prometheus-style metrics endpoint.

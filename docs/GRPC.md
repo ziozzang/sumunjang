@@ -87,3 +87,6 @@ addresses: event exporters must pseudonymize them. See
 Zone evidence: `NetworkEvidence.zone_ids` (10), `zone_ids_truncated` (11) and
 `zone_revision` (12) list the network zones containing the address (≤ 8, trimmed
 to the 1 KiB encode bound). See [network zones](NETWORK_ZONES.md).
+
+TLS material reloads without restart; gRPC TLS terminates in Sumunjang before
+tonic with the same bounds. See [operations](OPERATIONS.md).

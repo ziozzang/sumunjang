@@ -87,3 +87,44 @@ Use `--bootstrap-policy /config/bootstrap.json` to seed a new database only. Onc
 ## Management mTLS
 
 `--management-tls` serves the management listener over mandatory client-certificate HTTPS using the configured decision TLS identity/CA. Decision TLS settings and their native listener are required. Collector/admin token roles still apply; a certificate does not grant policy write access. The shared HTTP/1.1 runtime bounds connections, handshake/header reads and shutdown drain. Supervised mode retains the management listener during HUP. Plain management remains available for explicitly loopback deployments. Do not expose plaintext management as a remote Service.
+
+## TLS certificate rotation (hot reload) and probes
+
+The decision TLS material (`--decision-tls-cert`, `--decision-tls-key`,
+`--decision-client-ca`) serves the HGD1 mTLS listener, the gRPC listener and,
+with `--management-tls`, the management HTTPS listener. Sumunjang polls the three
+files every `--tls-reload-seconds` (default 10; 0 disables) by content digest —
+no inotify, so Kubernetes Secret volume updates (atomic `..data` symlink swaps by
+cert-manager/kubelet) are detected. On a change it reads the files once, builds
+new rustls configurations for all three listeners (same policy: mandatory
+client certificates from the explicit CA, safe protocol versions, no early data,
+listener ALPN) and swaps them atomically. New handshakes use the new material;
+established connections keep their session until they close (HGD1/management
+connections are capped at 300 s). Logs show
+`tls: reloaded certificate material; leaf sha256 <fingerprint>`.
+
+Invalid new material — unparsable PEM, a key that does not match the
+certificate, an empty CA, files over 1 MiB, missing files mid-rotation — is
+refused and the previous configuration keeps serving. `GET /v1/status` → `tls`
+reports `leaf_sha256`, `loaded_at`, `reloads_total`, `reload_failures_total`,
+`consecutive_failures`, `last_error` and `last_failure_at`; alert on a growing
+`reload_failures_total` or nonzero `consecutive_failures`. The same bad material
+is logged once and retried only when the files change again.
+
+TLS for gRPC is now terminated by Sumunjang (per-handshake current material, 3 s
+handshake bound, 2,048 connections, ALPN `h2`, client certificate required)
+before tonic, with the previous HTTP/2 bounds unchanged.
+
+Outbound clients already re-read their CA files on every use: the native
+Kubernetes authority reads its `ca` file on each collection (every 500 ms), the
+read-only policy source rebuilds its client when the CA bytes change, and signed
+update checks read `--update-ca` per check. No restart is needed after rotating
+those CA files.
+
+**Probes.** Use `--readiness-listen IP:port` (plain HTTP, probe-only, no admin
+routes) with `httpGet /readyz` for readiness and `/healthz` for liveness instead
+of TCP probes. `/readyz` returns 503 while the native Kubernetes source is not
+fresh or while the most recent durable checkpoint failed; TLS reload failures do
+not make the pod unready because the previous valid material keeps serving. The
+main listener exposes the same `/readyz`. See
+`deploy/sumunjang-native-authority-deployment.yaml`.
