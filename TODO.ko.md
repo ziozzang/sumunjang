@@ -602,3 +602,15 @@ NetworkZone/NetworkControl CRD 원천, 서명된 스냅샷 조회(PPG2/HGD), Pum
 `/readyz`는 최근 체크포인트 실패 시에도 실패하며 배포 템플릿에 HTTP 생존 프로브를
 추가했다. 서버 86개 테스트(실제 HGD1/gRPC/HTTPS 재적재 핸드셰이크와 tonic mTLS 호출)와
 Clippy가 통과했다. 남은 일: 원격 k3s 교체 검증 재실행, Prometheus 형식 지표 엔드포인트.
+
+## Prometheus 지표 — 2026-10-17
+
+브랜치 `feat/metrics`(`feat/tls-hot-reload` 기반, 로컬)는 관리 리스너에
+`GET /metrics`(Prometheus 텍스트 0.0.4)를 추가했다. `--management-tls`일 때 HTTPS/mTLS이며
+선택 읽기 전용 `HANGANG_GUARD_METRICS_TOKEN` 또는 관리자 자격으로 인가한다. 라벨은 제한된
+값만 쓴다: 전송/모드/결과/사유 코드별 판정, 사용 불가, 전송별 지연 히스토그램, 근거·용량
+카운터, 후보, 출처별 차단, 허용 목록, 존, 룰, 이력, 체크포인트, 관리 변경 결과, TLS
+재적재 카운터와 인증서 만료, GeoIP·Kubernetes 원천 신선도. 실시간 경로 기록은 원자적이고
+할당이 없으며(no_alloc 확인) DecisionRef가 사유 코드를 가진다. 코어 47·no_alloc 2·서버
+88개 테스트와 Clippy가 통과했다. 남은 일: 월드 패키지 차트의 ServiceMonitor/
+PrometheusRule, OpenMetrics 협상.

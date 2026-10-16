@@ -681,3 +681,18 @@ before tonic. Outbound Kubernetes/update clients already re-read CA files.
 adds an HTTP liveness probe. Server 86 tests (real HGD1/gRPC/HTTPS reload
 handshakes and a tonic mTLS call) and Clippy pass. Open: re-run the remote k3s
 rotation qualification; Prometheus-style metrics endpoint.
+
+## Prometheus metrics — 2026-10-17
+
+Branch `feat/metrics` (on `feat/tls-hot-reload`; local) adds `GET /metrics`
+(Prometheus text 0.0.4) on the management listener — HTTPS/mTLS with
+`--management-tls`, authorized by an optional read-only
+`HANGANG_GUARD_METRICS_TOKEN` or the admin credential. Bounded labels only:
+decisions by transport/mode/outcome/reason code, unavailable fences,
+per-transport latency histograms, evidence and capacity counters, candidates,
+blocks by source, allowlist, zones, rules, history, checkpoints, admin change
+results, TLS reload counters and leaf expiry, GeoIP and Kubernetes source
+freshness. Hot-path recording is atomic and allocation-free (no_alloc covered);
+DecisionRef now carries its reason code. Core 47 + no_alloc 2 and server 88
+tests and Clippy pass. Open: chart ServiceMonitor/PrometheusRule in the world
+package, OpenMetrics content negotiation.
