@@ -1,3 +1,8 @@
+mod actor;
+#[cfg(test)]
+mod api_tests;
+mod audit;
+mod explain;
 mod geoip;
 mod grpc;
 mod kubernetes;
@@ -118,6 +123,12 @@ struct Args {
     geoip_database: Option<PathBuf>,
     #[arg(long)]
     geoip_asn_database: Option<PathBuf>,
+    /// Maximum retained policy-change audit rows (oldest removed first).
+    #[arg(long, default_value_t = audit::DEFAULT_MAX_ROWS, value_parser = clap::value_parser!(u64).range(1000..=10_000_000))]
+    audit_max_rows: u64,
+    /// Maximum policy-change audit age in days.
+    #[arg(long, default_value_t = audit::DEFAULT_MAX_DAYS, value_parser = clap::value_parser!(u64).range(1..=3650))]
+    audit_retention_days: u64,
 }
 struct Inner {
     engine: Engine,
@@ -139,6 +150,8 @@ struct App {
     native_source: Option<Arc<kubernetes_authority::Owner>>,
     network_source: Arc<arc_swap::ArcSwapOption<kubernetes::SourceSnapshot>>,
     network_source_phase: Arc<std::sync::atomic::AtomicU8>,
+    audit: audit::Retention,
+    nonces: actor::Nonces,
 }
 impl App {
     fn source_remaining(&self, view: &guard_core::DecisionView) -> Option<u64> {
@@ -234,17 +247,105 @@ async fn network_source_evaluate(
     })
 }
 fn persist_state(db: &mut Connection, state: &guard_core::State) -> anyhow::Result<()> {
-    let encoded = serde_json::to_string(state)?;
-    let tx = db.transaction()?;
-    tx.execute("INSERT INTO checkpoint(id,body) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET body=excluded.body", [&encoded])?;
-    tx.commit()?;
+    persist_state_audited(db, state, None).map_err(PersistError::into_inner)
+}
+/// Where a checkpoint failed: before COMMIT nothing was written; a COMMIT
+/// failure leaves the durable outcome uncertain until the next checkpoint.
+enum PersistError {
+    Before(anyhow::Error),
+    Commit(anyhow::Error),
+}
+impl PersistError {
+    fn into_inner(self) -> anyhow::Error {
+        match self {
+            Self::Before(e) | Self::Commit(e) => e,
+        }
+    }
+}
+/// Checkpoint and audit row share one transaction: neither commits alone.
+fn persist_state_audited(
+    db: &mut Connection,
+    state: &guard_core::State,
+    record: Option<(&audit::Record, audit::Retention)>,
+) -> Result<(), PersistError> {
+    let encoded = serde_json::to_string(state).map_err(|e| PersistError::Before(e.into()))?;
+    let tx = db
+        .transaction()
+        .map_err(|e| PersistError::Before(e.into()))?;
+    tx.execute("INSERT INTO checkpoint(id,body) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET body=excluded.body", [&encoded]).map_err(|e| PersistError::Before(e.into()))?;
+    if let Some((record, retention)) = record {
+        audit::insert(&tx, retention, record).map_err(|e| PersistError::Before(e.into()))?;
+    }
+    tx.commit().map_err(|e| PersistError::Commit(e.into()))?;
     Ok(())
 }
-async fn operation<F>(app: App, durable: bool, f: F) -> ApiResult
+
+/// What an audited policy mutation changes.
+#[derive(Clone, Copy)]
+enum Scope {
+    Policy,
+    Rules,
+    Blocks,
+}
+struct Change {
+    actor: actor::Actor,
+    action: &'static str,
+    scope: Scope,
+    target: String,
+    reason: Option<String>,
+}
+impl Change {
+    fn new(
+        actor: actor::Actor,
+        action: &'static str,
+        scope: Scope,
+        target: impl Into<String>,
+    ) -> Self {
+        Self {
+            actor,
+            action,
+            scope,
+            target: target.into(),
+            reason: None,
+        }
+    }
+}
+fn scope_digest(scope: Scope, e: &Engine) -> String {
+    match scope {
+        Scope::Policy => audit::policy_digest(e),
+        Scope::Rules => audit::rules_digest(e),
+        Scope::Blocks => audit::blocks_digest(e),
+    }
+}
+fn scope_summary(scope: Scope, before: &Engine, after: &Engine) -> String {
+    match scope {
+        Scope::Policy => audit::policy_summary(before.policy(), after.policy()),
+        Scope::Rules => audit::rules_summary(before.rules(), after.rules()),
+        Scope::Blocks => audit::blocks_summary(before.blocks(), after.blocks()),
+    }
+}
+/// Best-effort refusal record; a failure cannot change an already refused outcome.
+fn record_refusal(app: &App, db: &mut Connection, mut record: audit::Record, message: String) {
+    record.result = audit::Outcome::Refused;
+    record.summary = format!("refused: {message}");
+    record.error = Some(message);
+    if let Err(e) = audit::insert_alone(db, app.audit, &record) {
+        eprintln!("audit refusal record failed: {e}");
+    }
+}
+fn audit_header(mut response: Response, id: &str) -> Response {
+    if let Ok(value) = axum::http::HeaderValue::from_str(id) {
+        response.headers_mut().insert("x-sumunjang-audit-id", value);
+    }
+    response
+}
+/// Durable, audited policy mutation on a cloned engine. The checkpoint and the
+/// audit row commit together; on any failure the published state is unchanged.
+async fn mutation<F>(app: App, change: Change, f: F) -> Result<Response, (StatusCode, Json<Value>)>
 where
     F: FnOnce(&mut Engine) -> anyhow::Result<Value> + Send + 'static,
 {
-    if app.native_source.is_some() && durable {
+    if app.native_source.is_some() {
         return Err(error(
             StatusCode::CONFLICT,
             "exclusive Kubernetes policy owner",
@@ -259,28 +360,100 @@ where
         let _permit = permit;
         // DB gate orders durable writes and checkpoints, so an older checkpoint
         // cannot overwrite a newly committed policy. Ordinary queries skip it.
-        let mut db =
-            if durable {
-                Some(app.db.lock().map_err(|_| {
-                    error(StatusCode::INTERNAL_SERVER_ERROR, "database unavailable")
-                })?)
-            } else {
-                None
-            };
+        let mut db = app
+            .db
+            .lock()
+            .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "database unavailable"))?;
         let mut inner = app
             .inner
             .lock()
             .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "state unavailable"))?;
-        let value = if let Some(ref mut db) = db {
-            let mut next = inner.engine.clone();
-            let result = f(&mut next).map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
-            persist_state(db, &next.state())
-                .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "checkpoint failed"))?;
-            inner.engine = next;
-            result
-        } else {
-            f(&mut inner.engine).map_err(|e| error(StatusCode::BAD_REQUEST, e))?
+        let mut record = audit::Record::new(change.actor, change.action, change.target);
+        record.reason = change.reason;
+        record.revision_before = Some(inner.engine.revision());
+        record.before_digest = Some(scope_digest(change.scope, &inner.engine));
+        let mut next = inner.engine.clone();
+        let value = match f(&mut next) {
+            Ok(value) => value,
+            Err(e) => {
+                record.revision_after = record.revision_before;
+                record.after_digest = record.before_digest.clone();
+                record.policy_revision = Some(inner.engine.policy_revision());
+                drop(inner);
+                record_refusal(&app, &mut db, record, e.to_string());
+                return Err(error(StatusCode::BAD_REQUEST, e));
+            }
         };
+        record.revision_after = Some(next.revision());
+        record.policy_revision = Some(next.policy_revision());
+        record.after_digest = Some(scope_digest(change.scope, &next));
+        record.summary = scope_summary(change.scope, &inner.engine, &next);
+        if let Err(failure) =
+            persist_state_audited(&mut db, &next.state(), Some((&record, app.audit)))
+        {
+            drop(inner);
+            let mut failed = record.clone();
+            failed.result = audit::Outcome::Uncertain;
+            failed.error = Some("checkpoint failed".into());
+            match failure {
+                // Same ID: if COMMIT did persist the committed row this insert
+                // fails on uniqueness; otherwise the uncertain row records it.
+                PersistError::Commit(_) => {
+                    let _ = audit::insert_alone(&mut db, app.audit, &failed);
+                }
+                PersistError::Before(e) => {
+                    record_refusal(
+                        &app,
+                        &mut db,
+                        record,
+                        format!("checkpoint or audit write failed: {e}"),
+                    );
+                }
+            }
+            return Err(error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "checkpoint failed",
+            ));
+        }
+        inner.engine = next;
+        if inner.engine.revision() != app.view.load().revision {
+            app.view.store(Arc::new(inner.engine.decision_view()));
+        }
+        drop(inner);
+        drop(db);
+        if serde_json::to_vec(&value)
+            .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "serialization failed"))?
+            .len()
+            > 4 * 1024 * 1024
+        {
+            return Err(error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "response exceeds size limit",
+            ));
+        }
+        Ok(audit_header(Json(value).into_response(), &record.id))
+    })
+    .await
+    .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "worker failed"))?
+}
+/// Non-durable engine operation (reads, evidence ingestion). Policy mutations
+/// use [`mutation`], which checkpoints and audits.
+async fn operation<F>(app: App, f: F) -> ApiResult
+where
+    F: FnOnce(&mut Engine) -> anyhow::Result<Value> + Send + 'static,
+{
+    let permit = app
+        .workers
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| error(StatusCode::SERVICE_UNAVAILABLE, "worker capacity reached"))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let mut inner = app
+            .inner
+            .lock()
+            .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "state unavailable"))?;
+        let value = f(&mut inner.engine).map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
         if inner.engine.revision() != app.view.load().revision {
             app.view.store(Arc::new(inner.engine.decision_view()));
         }
@@ -322,13 +495,13 @@ async fn events(HttpState(app): HttpState<App>, Json(batch): Json<EventBatch>) -
             "invalid event batch or timestamp",
         ));
     }
-    operation(app, false, move |engine| {
+    operation(app, move |engine| {
         Ok(serde_json::to_value(engine.ingest(batch, received)?)?)
     })
     .await
 }
 async fn snapshot(HttpState(app): HttpState<App>) -> ApiResult {
-    operation(app, false, |e| {
+    operation(app, |e| {
         anyhow::ensure!(
             e.rules().rules.is_empty(),
             "dynamic rules require decision protocol"
@@ -351,6 +524,18 @@ struct DecisionRequest {
     source_id: String,
     ip: std::net::IpAddr,
     kind: Option<guard_core::EventKind>,
+    /// Additive: include decision evidence (matched rules, ASN, country, reason code).
+    #[serde(default)]
+    evidence: bool,
+}
+/// Attach decision evidence computed on the currently published view.
+fn decision_with_evidence(app: &App, decision: Value, ip: std::net::IpAddr, time: u64) -> Response {
+    let mut decision = decision;
+    let view = app.view.load_full();
+    let catalog = app.geo.load_full();
+    let (evidence, _) = explain::decision_evidence(&view, &catalog, ip, time);
+    decision["evidence"] = evidence.to_json(view.mode, view.revision);
+    Json(decision).into_response()
 }
 async fn decision(
     HttpState(app): HttpState<App>,
@@ -374,15 +559,26 @@ async fn decision(
                 "exclusive Kubernetes policy owner",
             ));
         }
+        if input.evidence {
+            let value = serde_json::to_value(before).unwrap_or(Value::Null);
+            return Ok(decision_with_evidence(&app, value, input.ip, time));
+        }
         return Ok(Json(before).into_response());
     }
     // Admission reads never wait for evidence aggregation or admin fsync.
     if input.kind.is_none() || before.action == "deny" {
+        if input.evidence {
+            let value = serde_json::to_value(before).unwrap_or(Value::Null);
+            return Ok(decision_with_evidence(&app, value, input.ip, time));
+        }
         return Ok(Json(before).into_response());
     }
     drop(view);
+    let want_evidence = input.evidence;
+    let evidence_app = app.clone();
+    let evidence_ip = input.ip;
     let geo = app.geo.load_full();
-    operation(app, false, move |engine| {
+    operation(app, move |engine| {
         let ip = input.ip.to_string();
         if engine
             .decision_context(&ip, time, geo.context(input.ip))?
@@ -408,26 +604,36 @@ async fn decision(
         )?)?)
     })
     .await
-    .map(IntoResponse::into_response)
+    .map(|Json(value)| {
+        if want_evidence {
+            decision_with_evidence(&evidence_app, value, evidence_ip, time)
+        } else {
+            Json(value).into_response()
+        }
+    })
 }
 
 async fn status(HttpState(app): HttpState<App>) -> ApiResult {
     let max_requests = app.max_http_requests;
     let geoip = app.geo.load().status();
-    operation(app,false,move|e|{let(candidates,blocks)=e.capacity();Ok(json!({"health":"ok","stats":e.stats(),"geoip":geoip,"rules":{"count":e.rules().rules.len(),"snapshot_supported":e.rules().rules.is_empty()},"capacity":{"candidates":candidates,"blocks":blocks,"max_candidates":guard_core::MAX_CANDIDATES,"max_blocks":guard_core::MAX_BLOCKS,"max_batch":256,"max_body_bytes":4*1024*1024,"max_workers":1024,"max_requests":max_requests}}))}).await
+    operation(app,move|e|{let(candidates,blocks)=e.capacity();Ok(json!({"health":"ok","stats":e.stats(),"geoip":geoip,"rules":{"count":e.rules().rules.len(),"snapshot_supported":e.rules().rules.is_empty()},"capacity":{"candidates":candidates,"blocks":blocks,"max_candidates":guard_core::MAX_CANDIDATES,"max_blocks":guard_core::MAX_BLOCKS,"max_batch":256,"max_body_bytes":4*1024*1024,"max_workers":1024,"max_requests":max_requests}}))}).await
 }
 
 async fn candidates(HttpState(app): HttpState<App>) -> ApiResult {
-    operation(app, false, |e| {
-        Ok(serde_json::to_value(e.candidates(now()))?)
-    })
-    .await
+    operation(app, |e| Ok(serde_json::to_value(e.candidates(now()))?)).await
 }
 async fn policy_get(HttpState(app): HttpState<App>) -> ApiResult {
-    operation(app, false, |e| Ok(serde_json::to_value(e.policy())?)).await
+    operation(app, |e| Ok(serde_json::to_value(e.policy())?)).await
 }
-async fn policy_put(HttpState(app): HttpState<App>, Json(policy): Json<Policy>) -> ApiResult {
-    operation(app, true, move |e| {
+type Admin = axum::Extension<actor::Actor>;
+type MutationResult = Result<Response, (StatusCode, Json<Value>)>;
+async fn policy_put(
+    HttpState(app): HttpState<App>,
+    axum::Extension(actor): Admin,
+    Json(policy): Json<Policy>,
+) -> MutationResult {
+    let change = Change::new(actor, "policy.replace", Scope::Policy, "policy");
+    mutation(app, change, move |e| {
         e.set_policy(policy)?;
         Ok(json!({"ok":true}))
     })
@@ -439,18 +645,34 @@ async fn policy_put(HttpState(app): HttpState<App>, Json(policy): Json<Policy>) 
 struct PolicyReplacement {
     expected_revision: String,
     policy: Policy,
+    /// Optional operator-supplied change reason (≤ 256 bytes), kept in the audit.
+    #[serde(default)]
+    reason: Option<String>,
 }
 fn policy_document(e: &Engine) -> Value {
     json!({"revision": e.policy_revision(), "policy": e.policy()})
 }
 async fn policy_document_get(HttpState(app): HttpState<App>) -> ApiResult {
-    operation(app, false, |e| Ok(policy_document(e))).await
+    operation(app, |e| Ok(policy_document(e))).await
 }
 async fn policy_document_put(
     HttpState(app): HttpState<App>,
+    axum::Extension(actor): Admin,
     Json(input): Json<PolicyReplacement>,
-) -> ApiResult {
-    operation(app, true, move |e| {
+) -> MutationResult {
+    if input
+        .reason
+        .as_ref()
+        .is_some_and(|r| r.len() > 256 || r.chars().any(char::is_control))
+    {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "reason must be at most 256 bytes without control characters",
+        ));
+    }
+    let mut change = Change::new(actor, "policy.document.replace", Scope::Policy, "policy");
+    change.reason = input.reason.clone();
+    mutation(app, change, move |e| {
         anyhow::ensure!(e.policy_revision() == input.expected_revision, "policy revision conflict; draft preserved. Reload policy and reconcile before saving. / 정책 충돌: 초안은 유지됩니다. 저장된 정책을 다시 불러와 변경을 조정하세요.");
         e.set_policy(input.policy)?;
         Ok(policy_document(e))
@@ -461,36 +683,56 @@ async fn policy_document_put(
     })
 }
 async fn blocks(HttpState(app): HttpState<App>) -> ApiResult {
-    operation(app, false, |e| {
-        Ok(serde_json::to_value(e.snapshot(now()).blocks)?)
-    })
-    .await
+    operation(app, |e| Ok(serde_json::to_value(e.snapshot(now()).blocks)?)).await
 }
-async fn block_add(HttpState(app): HttpState<App>, Json(block): Json<Block>) -> ApiResult {
-    operation(app, true, move |e| {
-        e.add_block(block, now())?;
-        Ok(json!({"ok":true}))
-    })
+async fn block_add(
+    HttpState(app): HttpState<App>,
+    axum::Extension(actor): Admin,
+    Json(block): Json<Block>,
+) -> MutationResult {
+    let target = block.network.clone();
+    mutation(
+        app,
+        Change::new(actor, "blocks.add", Scope::Blocks, target),
+        move |e| {
+            e.add_block(block, now())?;
+            Ok(json!({"ok":true}))
+        },
+    )
     .await
 }
 #[derive(Deserialize)]
 struct Network {
     network: String,
 }
-async fn block_delete(HttpState(app): HttpState<App>, Json(input): Json<Network>) -> ApiResult {
-    operation(app, true, move |e| {
-        Ok(json!({"removed":e.remove_block(&input.network)?}))
-    })
+async fn block_delete(
+    HttpState(app): HttpState<App>,
+    axum::Extension(actor): Admin,
+    Json(input): Json<Network>,
+) -> MutationResult {
+    let target = input.network.clone();
+    mutation(
+        app,
+        Change::new(actor, "blocks.remove", Scope::Blocks, target),
+        move |e| Ok(json!({"removed":e.remove_block(&input.network)?})),
+    )
     .await
 }
 #[derive(Deserialize)]
 struct Approval {
     ip: String,
 }
-async fn approve(HttpState(app): HttpState<App>, Json(input): Json<Approval>) -> ApiResult {
-    operation(app, true, move |e| {
-        Ok(serde_json::to_value(e.approve(&input.ip, now())?)?)
-    })
+async fn approve(
+    HttpState(app): HttpState<App>,
+    axum::Extension(actor): Admin,
+    Json(input): Json<Approval>,
+) -> MutationResult {
+    let target = input.ip.clone();
+    mutation(
+        app,
+        Change::new(actor, "candidates.approve", Scope::Blocks, target),
+        move |e| Ok(serde_json::to_value(e.approve(&input.ip, now())?)?),
+    )
     .await
 }
 #[derive(Deserialize)]
@@ -500,7 +742,7 @@ struct LookupRequest {
 }
 async fn lookup(HttpState(app): HttpState<App>, Json(input): Json<LookupRequest>) -> ApiResult {
     let geo = app.geo.load_full();
-    operation(app, false, move |engine| {
+    operation(app, move |engine| {
         let ip = input.ip.to_string();
         let inspection = engine.inspect_ip(&ip, now(), geo.context(input.ip))?;
         Ok(json!({"ip":ip,"geoip":geo.lookup(input.ip),"inspection":inspection}))
@@ -508,14 +750,17 @@ async fn lookup(HttpState(app): HttpState<App>, Json(input): Json<LookupRequest>
     .await
 }
 async fn network_inspect(HttpState(app): HttpState<App>, Json(input): Json<Network>) -> ApiResult {
-    operation(app, false, move |engine| {
+    operation(app, move |engine| {
         Ok(serde_json::to_value(
             engine.inspect_network(&input.network, now())?,
         )?)
     })
     .await
 }
-async fn geo_reload(HttpState(app): HttpState<App>) -> ApiResult {
+async fn geo_reload(
+    HttpState(app): HttpState<App>,
+    axum::Extension(actor): Admin,
+) -> MutationResult {
     if app.native_source.is_some() {
         return Err(error(
             StatusCode::CONFLICT,
@@ -528,25 +773,109 @@ async fn geo_reload(HttpState(app): HttpState<App>) -> ApiResult {
         .try_acquire_owned()
         .map_err(|_| error(StatusCode::CONFLICT, "GeoIP reload already running"))?;
     let paths = app.geo_paths.clone();
-    let catalog = tokio::task::spawn_blocking(move || geoip::GeoCatalog::load(&paths))
+    let mut record = audit::Record::new(actor, "geoip.reload", "geoip");
+    let before = serde_json::to_value(app.geo.load().status()).unwrap_or(Value::Null);
+    record.before_digest = Some(audit::digest(&before));
+    let catalog = match tokio::task::spawn_blocking(move || geoip::GeoCatalog::load(&paths))
         .await
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "GeoIP worker failed"))?
-        .map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
+    {
+        Ok(catalog) => catalog,
+        Err(e) => {
+            record.after_digest = record.before_digest.clone();
+            let audit_app = app.clone();
+            let message = format!("GeoIP reload failed; last good catalog kept: {e}");
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Ok(mut db) = audit_app.db.lock() {
+                    record_refusal(&audit_app, &mut db, record, message);
+                }
+            })
+            .await;
+            return Err(error(StatusCode::BAD_REQUEST, e));
+        }
+    };
     let status = catalog.status();
+    let after = serde_json::to_value(&status).unwrap_or(Value::Null);
+    record.after_digest = Some(audit::digest(&after));
+    record.summary = format!(
+        "GeoIP catalog reloaded: {} -> {}",
+        geo_label(&before),
+        geo_label(&after)
+    );
+    // The audit row commits before the in-memory swap, which cannot fail.
+    let audit_app = app.clone();
+    let id = record.id.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut db = audit_app
+            .db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("database unavailable"))?;
+        audit::insert_alone(&mut db, audit_app.audit, &record)
+    })
+    .await
+    .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "audit worker failed"))?
+    .map_err(|_| {
+        error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "audit write failed; GeoIP catalog unchanged",
+        )
+    })?;
     app.geo.store(Arc::new(catalog));
-    Ok(Json(json!({"geoip":status})))
+    Ok(audit_header(
+        Json(json!({"geoip":status})).into_response(),
+        &id,
+    ))
+}
+fn geo_label(status: &Value) -> String {
+    let part = |name: &str| {
+        let v = &status[name];
+        if v.is_null() {
+            format!("{name}=none")
+        } else {
+            format!(
+                "{name}={}@{}",
+                v["database_type"].as_str().unwrap_or("?"),
+                v["build_epoch"]
+            )
+        }
+    };
+    format!("{} {}", part("country"), part("asn"))
+}
+/// Record a refused mutation whose engine closure never ran.
+async fn refuse_unapplied(app: &App, change: Change, message: String) {
+    let app = app.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        let mut record = audit::Record::new(change.actor, change.action, change.target);
+        record.reason = change.reason;
+        if let Ok(inner) = app.inner.lock() {
+            record.revision_before = Some(inner.engine.revision());
+            record.revision_after = record.revision_before;
+            record.policy_revision = Some(inner.engine.policy_revision());
+            record.before_digest = Some(scope_digest(change.scope, &inner.engine));
+            record.after_digest = record.before_digest.clone();
+        }
+        if let Ok(mut db) = app.db.lock() {
+            record_refusal(&app, &mut db, record, message);
+        }
+    })
+    .await;
 }
 async fn rules_get(HttpState(app): HttpState<App>) -> ApiResult {
-    operation(app, false, |e| Ok(serde_json::to_value(e.rules())?)).await
+    operation(app, |e| Ok(serde_json::to_value(e.rules())?)).await
 }
 async fn rules_put(
     HttpState(app): HttpState<App>,
+    axum::Extension(actor): Admin,
     Json(rules): Json<guard_core::RuleSet>,
-) -> ApiResult {
-    operation(app, true, move |e| {
-        e.set_rules(rules)?;
-        Ok(serde_json::to_value(e.rules())?)
-    })
+) -> MutationResult {
+    mutation(
+        app,
+        Change::new(actor, "rules.replace", Scope::Rules, "rules"),
+        move |e| {
+            e.set_rules(rules)?;
+            Ok(serde_json::to_value(e.rules())?)
+        },
+    )
     .await
 }
 #[derive(Deserialize)]
@@ -571,9 +900,24 @@ async fn compile_script(
     .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "rule worker failed"))?
     .map_err(|e| error(StatusCode::BAD_REQUEST, e))
 }
-async fn rules_lua(HttpState(app): HttpState<App>, Json(input): Json<LuaRequest>) -> ApiResult {
-    let rules = compile_script(&app, input.script).await?;
-    operation(app, true, move |e| {
+async fn rules_lua(
+    HttpState(app): HttpState<App>,
+    axum::Extension(actor): Admin,
+    Json(input): Json<LuaRequest>,
+) -> MutationResult {
+    let change = Change::new(actor, "rules.lua.replace", Scope::Rules, "rules");
+    let rules = match compile_script(&app, input.script).await {
+        Ok(rules) => rules,
+        Err(refusal) => {
+            let message = refusal.1.0["error"]
+                .as_str()
+                .unwrap_or("Lua compilation failed")
+                .to_owned();
+            refuse_unapplied(&app, change, format!("Lua compilation failed: {message}")).await;
+            return Err(refusal);
+        }
+    };
+    mutation(app, change, move |e| {
         e.set_rules(rules)?;
         Ok(serde_json::to_value(e.rules())?)
     })
@@ -667,6 +1011,14 @@ fn router(app: App) -> Router {
             get(blocks).post(block_add).delete(block_delete),
         )
         .route("/v1/candidates/approve", post(approve))
+        .route("/v1/audit", get(audit_get))
+        .route("/v1/audit/query", post(audit_post))
+        .route(
+            "/v1/explain",
+            post(explain::explain).layer(DefaultBodyLimit::max(128 * 1024)),
+        )
+        .route("/v1/explain/batch", post(explain::batch))
+        .route("/v1/reasons", get(explain::reasons))
         .layer(DefaultBodyLimit::max(4 * 1024 * 1024))
         .layer(axum::middleware::from_fn(
             move |request: axum::extract::Request, next: axum::middleware::Next| {
@@ -684,10 +1036,13 @@ fn router(app: App) -> Router {
                             .into_response();
                         }
                     };
-                    let path = request.uri().path();
+                    let path = request.uri().path().to_owned();
+                    let path = path.as_str();
+                    let admin_path = path.starts_with("/v1/")
+                        && !matches!(path, "/v1/events" | "/v1/snapshot" | "/v1/decision");
                     let token = if matches!(path, "/v1/events" | "/v1/snapshot" | "/v1/decision") {
                         Some(credentials.collector.as_str())
-                    } else if path.starts_with("/v1/") {
+                    } else if admin_path {
                         Some(credentials.admin.as_str())
                     } else {
                         None
@@ -696,6 +1051,13 @@ fn router(app: App) -> Router {
                         && let Err(e) = authorize(request.headers(), token)
                     {
                         return e.into_response();
+                    }
+                    let mut request = request;
+                    if admin_path {
+                        request = match admin_actor(&credentials, request).await {
+                            Ok(request) => request,
+                            Err(response) => return response,
+                        };
                     }
                     if path == "/v1/decision"
                         && credentials
@@ -717,8 +1079,27 @@ fn router(app: App) -> Router {
                                         | "/v1/networks/inspect"
                                         | "/v1/rules/validate"
                                         | "/v1/update/check"
+                                        | "/v1/audit/query"
+                                        | "/v1/explain"
+                                        | "/v1/explain/batch"
                                 )))
                     {
+                        if let Some(action) = action_for(request.method(), path)
+                            && let Some(actor) = request.extensions().get::<actor::Actor>()
+                        {
+                            let change = Change::new(
+                                actor.clone(),
+                                action,
+                                Scope::Policy,
+                                action_target(action),
+                            );
+                            refuse_unapplied(
+                                &credentials,
+                                change,
+                                "exclusive Kubernetes policy owner".into(),
+                            )
+                            .await;
+                        }
                         return error(StatusCode::CONFLICT, "exclusive Kubernetes policy owner")
                             .into_response();
                     }
@@ -742,10 +1123,132 @@ fn router(app: App) -> Router {
         ))
         .with_state(app)
 }
+/// Attach the administrative actor: a verified Hangang delegated actor when the
+/// broker signed the request, otherwise the shared admin credential.
+async fn admin_actor(
+    app: &App,
+    mut request: axum::extract::Request,
+) -> Result<axum::extract::Request, Response> {
+    let headers = request.headers();
+    let assertions: Vec<_> = headers.get_all(actor::ASSERTION_HEADER).iter().collect();
+    let macs: Vec<_> = headers.get_all(actor::MAC_HEADER).iter().collect();
+    if assertions.is_empty() && macs.is_empty() {
+        request.extensions_mut().insert(actor::Actor::credential());
+        return Ok(request);
+    }
+    let invalid = || {
+        error(
+            StatusCode::UNAUTHORIZED,
+            "invalid delegated actor assertion",
+        )
+        .into_response()
+    };
+    let (Some(encoded), Some(mac)) = (
+        assertions
+            .first()
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned),
+        macs.first()
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned),
+    ) else {
+        return Err(invalid());
+    };
+    if assertions.len() != 1 || macs.len() != 1 {
+        return Err(invalid());
+    }
+    let (parts, body) = request.into_parts();
+    let bytes = axum::body::to_bytes(body, 4 * 1024 * 1024)
+        .await
+        .map_err(|_| {
+            error(StatusCode::PAYLOAD_TOO_LARGE, "request body exceeds limit").into_response()
+        })?;
+    let actor = actor::verify(
+        &encoded,
+        &mac,
+        app.admin.as_bytes(),
+        parts.method.as_str(),
+        parts.uri.path(),
+        &bytes,
+        now(),
+        &app.nonces,
+    )
+    .map_err(|message| error(StatusCode::UNAUTHORIZED, message).into_response())?;
+    let mut request = axum::extract::Request::from_parts(parts, axum::body::Body::from(bytes));
+    request.extensions_mut().insert(actor);
+    Ok(request)
+}
+/// Audit action names of administrative mutation endpoints.
+fn action_for(method: &axum::http::Method, path: &str) -> Option<&'static str> {
+    use axum::http::Method;
+    Some(match (method, path) {
+        (&Method::PUT, "/v1/policy") => "policy.replace",
+        (&Method::PUT, "/v1/policy/document") => "policy.document.replace",
+        (&Method::POST, "/v1/blocks") => "blocks.add",
+        (&Method::DELETE, "/v1/blocks") => "blocks.remove",
+        (&Method::POST, "/v1/candidates/approve") => "candidates.approve",
+        (&Method::PUT, "/v1/rules") => "rules.replace",
+        (&Method::PUT, "/v1/rules/lua") => "rules.lua.replace",
+        (&Method::POST, "/v1/geoip/reload") => "geoip.reload",
+        (&Method::POST, "/v1/update/check") => "update.check",
+        _ => return None,
+    })
+}
+fn action_target(action: &str) -> &'static str {
+    match action.split('.').next() {
+        Some("policy") => "policy",
+        Some("blocks") | Some("candidates") => "blocks",
+        Some("rules") => "rules",
+        Some("geoip") => "geoip",
+        Some("update") => "update",
+        _ => "unknown",
+    }
+}
+async fn audit_get(
+    HttpState(app): HttpState<App>,
+    query: Result<axum::extract::Query<audit::Filter>, axum::extract::rejection::QueryRejection>,
+) -> ApiResult {
+    let axum::extract::Query(filter) = query.map_err(|e| {
+        error(
+            StatusCode::BAD_REQUEST,
+            format!("invalid audit filter: {e}"),
+        )
+    })?;
+    audit_query(app, filter).await
+}
+async fn audit_post(
+    HttpState(app): HttpState<App>,
+    Json(filter): Json<audit::Filter>,
+) -> ApiResult {
+    audit_query(app, filter).await
+}
+async fn audit_query(app: App, filter: audit::Filter) -> ApiResult {
+    let permit = app
+        .workers
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| error(StatusCode::SERVICE_UNAVAILABLE, "worker capacity reached"))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let db = app
+            .db
+            .lock()
+            .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "database unavailable"))?;
+        audit::query(&db, app.audit, &filter)
+            .map(Json)
+            .map_err(|e| match e.downcast_ref::<rusqlite::Error>() {
+                Some(_) => error(StatusCode::SERVICE_UNAVAILABLE, "audit store unavailable"),
+                None => error(StatusCode::BAD_REQUEST, e),
+            })
+    })
+    .await
+    .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "worker failed"))?
+}
 fn open_database(path: &std::path::Path) -> anyhow::Result<Connection> {
     let db = Connection::open(path)?;
     db.busy_timeout(std::time::Duration::from_secs(5))?;
     db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS checkpoint(id INTEGER PRIMARY KEY CHECK(id=1), body TEXT NOT NULL);")?;
+    audit::init(&db)?;
     Ok(db)
 }
 
@@ -765,33 +1268,82 @@ async fn update_status(HttpState(app): HttpState<App>) -> ApiResult {
     })?))
 }
 
-async fn update_check(HttpState(app): HttpState<App>) -> ApiResult {
-    let Some(path) = app.update_request else {
+async fn update_check(
+    HttpState(app): HttpState<App>,
+    axum::Extension(actor): Admin,
+) -> MutationResult {
+    let Some(path) = app.update_request.clone() else {
+        refuse_unapplied(
+            &app,
+            Change::new(actor, "update.check", Scope::Policy, "update"),
+            "automatic updates are disabled".into(),
+        )
+        .await;
         return Err(error(
             StatusCode::CONFLICT,
             "automatic updates are disabled",
         ));
     };
+    // Two-phase: the request file is outside SQLite, so record `uncertain`
+    // first, then finalize. A crash in between truthfully stays uncertain.
+    let mut record = audit::Record::new(actor, "update.check", "update");
+    record.result = audit::Outcome::Uncertain;
+    record.summary = "signed release check requested from the supervisor".into();
+    let id = record.id.clone();
+    let audit_app = app.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut db = audit_app
+            .db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("database unavailable"))?;
+        audit::insert_alone(&mut db, audit_app.audit, &record)
+    })
+    .await
+    .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "audit worker failed"))?
+    .map_err(|_| {
+        error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "audit write failed; update check not queued",
+        )
+    })?;
     let mut options = tokio::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     options.mode(0o600);
-    match options.open(path).await {
-        Ok(file) => file.sync_all().await.map_err(|_| {
-            error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "could not queue update check",
+    let queued = match options.open(path).await {
+        Ok(file) => file.sync_all().await.is_ok(),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => true,
+        Err(_) => false,
+    };
+    let finish_app = app.clone();
+    let finish_id = id.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        let db = finish_app
+            .db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("database unavailable"))?;
+        if queued {
+            audit::finish(&db, &finish_id, audit::Outcome::Committed, None)
+        } else {
+            audit::finish(
+                &db,
+                &finish_id,
+                audit::Outcome::Refused,
+                Some("could not queue update check"),
             )
-        })?,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(_) => {
-            return Err(error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "could not queue update check",
-            ));
         }
+    })
+    .await;
+    if !queued {
+        return Err(error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "could not queue update check",
+        ));
     }
-    Ok(Json(json!({"queued":true})))
+    Ok(audit_header(
+        Json(json!({"queued":true})).into_response(),
+        &id,
+    ))
 }
 
 fn read_bounded(path: &std::path::Path, max: usize) -> anyhow::Result<Vec<u8>> {
@@ -1078,6 +1630,11 @@ async fn run(args: Args) -> anyhow::Result<()> {
         Err(rusqlite::Error::QueryReturnedNoRows) => Engine::new(Policy::default())?,
         Err(e) => return Err(e.into()),
     };
+    let audit_retention = audit::Retention {
+        max_rows: args.audit_max_rows,
+        max_days: args.audit_retention_days,
+    };
+    let startup_before = Some(engine.clone());
     if fresh_database && let Some(path) = args.bootstrap_policy {
         engine.set_policy(serde_json::from_slice(&read_bounded(&path, 1024 * 1024)?)?)?;
     }
@@ -1087,7 +1644,31 @@ async fn run(args: Args) -> anyhow::Result<()> {
     if let Some(path) = args.asn_catalog {
         engine.set_asn_catalog(serde_json::from_slice(&std::fs::read(path)?)?)?;
     }
-    persist_state(&mut db, &engine.state())?;
+    // Startup configuration files that change stored policy are audited with
+    // the checkpoint that makes them durable.
+    let startup_record = startup_before.and_then(|before| {
+        let changed = audit::state_digest(&before) != audit::state_digest(&engine);
+        changed.then(|| {
+            let mut record = audit::Record::new(actor::Actor::local(), "startup.import", "policy");
+            record.revision_before = Some(before.revision());
+            record.revision_after = Some(engine.revision());
+            record.policy_revision = Some(engine.policy_revision());
+            record.before_digest = Some(audit::state_digest(&before));
+            record.after_digest = Some(audit::state_digest(&engine));
+            record.summary = format!(
+                "{}; {}",
+                audit::policy_summary(before.policy(), engine.policy()),
+                audit::rules_summary(before.rules(), engine.rules())
+            );
+            record
+        })
+    });
+    persist_state_audited(
+        &mut db,
+        &engine.state(),
+        startup_record.as_ref().map(|r| (r, audit_retention)),
+    )
+    .map_err(PersistError::into_inner)?;
     let geo_paths = geoip::GeoPaths {
         country: args.geoip_database,
         asn: args.geoip_asn_database,
@@ -1103,6 +1684,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
         .map(|_| kubernetes_authority::Owner::new())
         .transpose()?;
     let app = App {
+        audit: audit_retention,
+        nonces: actor::Nonces::default(),
         native_source,
         network_source: Arc::new(arc_swap::ArcSwapOption::empty()),
         network_source_phase: Arc::new(std::sync::atomic::AtomicU8::new(0)),
@@ -1302,7 +1885,10 @@ async fn checkpoint(app: App) -> anyhow::Result<()> {
             inner.engine.state()
         };
         // Serialization and SQLite fsync run without holding the engine lock.
-        persist_state(&mut db, &state)
+        persist_state(&mut db, &state)?;
+        // Age retention also applies when no new audit rows arrive.
+        audit::prune(&db, app.audit, now().saturating_mul(1000))?;
+        Ok(())
     })
     .await?
 }
@@ -1329,7 +1915,10 @@ mod tests {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch("CREATE TABLE checkpoint(id INTEGER PRIMARY KEY,body TEXT NOT NULL)")
             .unwrap();
+        audit::init(&db).unwrap();
         App {
+            audit: audit::Retention::default(),
+            nonces: actor::Nonces::default(),
             native_source: None,
             network_source: Arc::new(arc_swap::ArcSwapOption::empty()),
             network_source_phase: Arc::new(std::sync::atomic::AtomicU8::new(0)),

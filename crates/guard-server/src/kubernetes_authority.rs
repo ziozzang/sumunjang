@@ -342,7 +342,45 @@ fn install(
         p.remaining(&owner.clock).is_some(),
         "source expired before persistence"
     );
-    crate::persist_state(&mut db, &engine.state())?;
+    // Only content changes are audited; the source is re-read every 500 ms.
+    let before = crate::audit::state_digest(&inner.engine);
+    let after = crate::audit::state_digest(&engine);
+    let record = (before != after).then(|| {
+        let source = owner
+            .config
+            .get()
+            .map(|c| {
+                format!(
+                    "{}/{}",
+                    c["namespace"].as_str().unwrap_or("?"),
+                    c["name"].as_str().unwrap_or("?")
+                )
+            })
+            .unwrap_or_else(|| "unknown".into());
+        let mut record = crate::audit::Record::new(
+            crate::actor::Actor::kubernetes(&source),
+            "kubernetes.authority.publish",
+            format!("resourceVersion={}", p.version),
+        );
+        record.revision_before = Some(inner.engine.revision());
+        record.revision_after = Some(engine.revision());
+        record.policy_revision = Some(engine.policy_revision());
+        record.before_digest = Some(before);
+        record.after_digest = Some(after);
+        record.summary = format!(
+            "{}; {}; {}",
+            crate::audit::policy_summary(inner.engine.policy(), engine.policy()),
+            crate::audit::rules_summary(inner.engine.rules(), engine.rules()),
+            crate::audit::blocks_summary(inner.engine.blocks(), engine.blocks())
+        );
+        record
+    });
+    crate::persist_state_audited(
+        &mut db,
+        &engine.state(),
+        record.as_ref().map(|r| (r, app.audit)),
+    )
+    .map_err(crate::PersistError::into_inner)?;
     ensure!(
         p.remaining(&owner.clock).is_some(),
         "source expired during persistence"
@@ -469,6 +507,72 @@ mod tests {
             v["spec"] = spec;
             assert!(decode(&serde_json::to_vec(&v).unwrap(), &config()).is_err());
         }
+    }
+    #[tokio::test]
+    async fn content_changes_and_refused_writers_are_audited_once() {
+        use axum::{
+            body::Body,
+            http::{Request, StatusCode},
+        };
+        use tower::ServiceExt;
+        let app = owned_app();
+        publish(&app, 900);
+        publish(&app, 900);
+        let rows = |app: &App| {
+            let db = app.db.lock().unwrap();
+            crate::audit::query(&db, app.audit, &crate::audit::Filter::default()).unwrap()
+                ["entries"]
+                .as_array()
+                .unwrap()
+                .clone()
+        };
+        let entries = rows(&app);
+        assert_eq!(
+            entries.len(),
+            1,
+            "unchanged republication must not be audited"
+        );
+        assert_eq!(entries[0]["action"], "kubernetes.authority.publish");
+        assert_eq!(entries[0]["actor"]["kind"], "kubernetes");
+        assert_eq!(entries[0]["target"], "resourceVersion=opaque:one");
+        assert!(
+            entries[0]["summary"]
+                .as_str()
+                .unwrap()
+                .contains("added deny-test")
+        );
+        let owner = app.native_source.as_ref().unwrap();
+        let mut changed = object();
+        changed["metadata"]["resourceVersion"] = json!("opaque:two");
+        changed["spec"]["rules"]["rules"][0]["action"] = json!("observe");
+        let (engine, version) = decode(&serde_json::to_vec(&changed).unwrap(), &config()).unwrap();
+        install(&app, owner, engine, version, deadline(owner, 900)).unwrap();
+        let entries = rows(&app);
+        assert_eq!(entries.len(), 2);
+        assert!(
+            entries[0]["summary"]
+                .as_str()
+                .unwrap()
+                .contains("changed deny-test")
+        );
+        let response = crate::router(app.clone())
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/v1/rules")
+                    .header("authorization", format!("Bearer {}", app.admin))
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let entries = rows(&app);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(
+            (entries[0]["action"].clone(), entries[0]["result"].clone()),
+            (json!("rules.replace"), json!("refused"))
+        );
     }
     #[tokio::test]
     async fn exact_publication_expiry_withdrawal_restart_and_same_version_renewal() {
