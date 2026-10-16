@@ -87,9 +87,12 @@ fn main() {
                     network: n.to_string(),
                     expires_at: 200,
                     reason: "benchmark".into(),
+                    ..Default::default()
                 })
                 .collect();
             let engine = Engine::restore(State {
+                block_origins: Default::default(),
+                rules_script: None,
                 policy: Policy {
                     mode: Mode::Enforce,
                     ..Policy::default()

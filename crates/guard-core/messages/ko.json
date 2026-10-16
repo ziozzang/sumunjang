@@ -7,6 +7,7 @@
   "sumunjang.deny.block_manual": "수동 차단 {network}에 의해 거부되었습니다.",
   "sumunjang.deny.block_approved": "승인된 후보 차단 {network}에 의해 거부되었습니다.",
   "sumunjang.deny.block_automatic": "자동 임계값 차단 {network}에 의해 거부되었습니다.",
+  "sumunjang.deny.block_source": "Kubernetes 정책 원천 차단 {network}에 의해 거부되었습니다.",
   "sumunjang.unavailable.revision_floor": "사용 불가: 게시된 리비전이 요청한 최소 리비전보다 낮습니다.",
   "sumunjang.unavailable.owner_replaced": "사용 불가: 평가 중 정책 또는 GeoIP 소유자가 교체되었습니다. 다시 시도하세요.",
   "sumunjang.unavailable.source": "사용 불가: 네이티브 정책 원천이 최신 상태가 아닙니다.",

@@ -7,6 +7,7 @@
   "sumunjang.deny.block_manual": "Denied by manual block {network}.",
   "sumunjang.deny.block_approved": "Denied by approved candidate block {network}.",
   "sumunjang.deny.block_automatic": "Denied by automatic threshold block {network}.",
+  "sumunjang.deny.block_source": "Denied by Kubernetes policy source block {network}.",
   "sumunjang.unavailable.revision_floor": "Unavailable: the published revision is below the requested minimum revision.",
   "sumunjang.unavailable.owner_replaced": "Unavailable: policy or GeoIP owner changed during evaluation; retry.",
   "sumunjang.unavailable.source": "Unavailable: the native policy source is not fresh.",

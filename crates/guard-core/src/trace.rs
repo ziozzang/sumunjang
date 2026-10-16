@@ -9,7 +9,7 @@
 //! function with [`VecTrace`], a bounded event buffer. Tracers only receive facts;
 //! the evaluator never reads anything back from them, so a tracer cannot change a
 //! decision.
-use crate::{Block, Mode, RuleAction, rules::Rule};
+use crate::{Block, BlockSource, Mode, RuleAction, rules::Rule};
 
 /// Receives facts in evaluation order.
 pub trait Tracer<'a> {
@@ -196,9 +196,17 @@ pub fn reason_code(
             Some(RuleAction::Deny) => "sumunjang.deny.rule",
             _ => "sumunjang.allow.rule",
         },
-        DecidingStage::Block => match block.map(|b| b.reason.as_str()) {
-            Some(AUTOMATIC_BLOCK_REASON) => "sumunjang.deny.block_automatic",
-            Some(APPROVED_BLOCK_REASON) => "sumunjang.deny.block_approved",
+        // Provenance decides; pre-provenance blocks fall back to Sumunjang's
+        // own fixed reasons.
+        DecidingStage::Block => match block.map(|b| (b.origin.source, b.reason.as_str())) {
+            Some((BlockSource::Auto, _)) | Some((BlockSource::Unknown, AUTOMATIC_BLOCK_REASON)) => {
+                "sumunjang.deny.block_automatic"
+            }
+            Some((BlockSource::Approved, _))
+            | Some((BlockSource::Unknown, APPROVED_BLOCK_REASON)) => {
+                "sumunjang.deny.block_approved"
+            }
+            Some((BlockSource::Kubernetes, _)) => "sumunjang.deny.block_source",
             _ => "sumunjang.deny.block_manual",
         },
     }

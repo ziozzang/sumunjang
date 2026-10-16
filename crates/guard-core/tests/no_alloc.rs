@@ -55,6 +55,15 @@ fn engine(mode: Mode, with_rules: bool) -> Engine {
     let mut e = Engine::new(Policy {
         mode,
         allow: vec!["192.0.2.42/32".into(), "2001:db8:42::/48".into()],
+        // Expiring allow entry: matches at 100, not at 130/2000.
+        allow_meta: [(
+            "2001:db8:42::/48".to_string(),
+            guard_core::AllowMeta {
+                expires_at: Some(120),
+                ..Default::default()
+            },
+        )]
+        .into(),
         ..Policy::default()
     })
     .unwrap();
@@ -74,6 +83,7 @@ fn engine(mode: Mode, with_rules: bool) -> Engine {
                 network: network.into(),
                 expires_at,
                 reason: reason.into(),
+                ..Default::default()
             },
             100,
         )

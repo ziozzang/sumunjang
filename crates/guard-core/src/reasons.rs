@@ -19,6 +19,7 @@ pub const DECISION_CODES: &[&str] = &[
     "sumunjang.deny.block_manual",
     "sumunjang.deny.block_approved",
     "sumunjang.deny.block_automatic",
+    "sumunjang.deny.block_source",
     "sumunjang.unavailable.revision_floor",
     "sumunjang.unavailable.owner_replaced",
     "sumunjang.unavailable.source",

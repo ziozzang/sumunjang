@@ -1,3 +1,4 @@
+pub mod history;
 pub mod reasons;
 pub mod rules;
 pub mod trace;
@@ -49,12 +50,70 @@ pub struct EventBatch {
     pub source_id: String,
     pub events: Vec<Event>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Block {
     pub network: String,
     pub expires_at: u64,
     pub reason: String,
+    /// Provenance kept beside the wire shape: never part of snapshots or the
+    /// `POST /v1/blocks` input; persisted separately in `State::block_origins`.
+    #[serde(skip)]
+    pub origin: BlockOrigin,
+}
+/// Who or what created a block.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockSource {
+    /// Created before provenance was recorded.
+    #[default]
+    Unknown,
+    /// `POST /v1/blocks` by an administrator.
+    Manual,
+    /// Reviewed candidate approval.
+    Approved,
+    /// Automatic threshold blocking.
+    Auto,
+    /// Native Kubernetes policy source.
+    Kubernetes,
+}
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BlockOrigin {
+    pub source: BlockSource,
+    pub created_at: Option<u64>,
+    pub created_by: Option<String>,
+}
+/// Optional allowlist entry metadata, keyed by canonical allow network.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AllowMeta {
+    /// Entry stops matching at this Unix time (checked on every lookup).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<String>,
+}
+fn text_ok(v: &Option<String>, max: usize) -> bool {
+    v.as_ref()
+        .is_none_or(|v| v.len() <= max && !v.chars().any(char::is_control))
+}
+/// Allowlist trie with entry expiry (`u64::MAX`: no expiry).
+fn allow_trie(policy: &Policy) -> Result<PrefixTrie<u64>> {
+    let mut trie = PrefixTrie::default();
+    for n in &policy.allow {
+        let expires = policy
+            .allow_meta
+            .get(n)
+            .and_then(|m| m.expires_at)
+            .unwrap_or(u64::MAX);
+        trie.insert(canonical_network(n)?, expires);
+    }
+    Ok(trie)
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
@@ -94,6 +153,9 @@ pub struct Policy {
     pub block_ttl_secs: u64,
     pub allow: Vec<String>,
     pub weights: Weights,
+    /// Additive per-entry metadata for `allow` (expiry, reason, provenance).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub allow_meta: BTreeMap<String, AllowMeta>,
 }
 impl Default for Policy {
     fn default() -> Self {
@@ -105,6 +167,7 @@ impl Default for Policy {
             block_ttl_secs: 900,
             allow: vec![],
             weights: Weights::default(),
+            allow_meta: BTreeMap::new(),
         }
     }
 }
@@ -185,6 +248,33 @@ impl Policy {
                 Err(e) => errors.push(FieldError::new(format!("/allow/{i}"), e.to_string())),
             }
         }
+        for (key, meta) in &self.allow_meta {
+            let at = format!("/allow_meta/{}", key.replace('~', "~0").replace('/', "~1"));
+            if !canonical_network(key).is_ok_and(|k| seen.contains(&k)) {
+                errors.push(FieldError::new(
+                    at.clone(),
+                    "metadata for a network not in allow",
+                ));
+            }
+            if !text_ok(&meta.reason, 128) {
+                errors.push(FieldError::new(
+                    format!("{at}/reason"),
+                    "reason must be at most 128 bytes without control characters",
+                ));
+            }
+            if !text_ok(&meta.created_by, 64) {
+                errors.push(FieldError::new(
+                    format!("{at}/created_by"),
+                    "invalid created_by",
+                ));
+            }
+            if meta.expires_at == Some(0) {
+                errors.push(FieldError::new(
+                    format!("{at}/expires_at"),
+                    "invalid expiry",
+                ));
+            }
+        }
         errors.truncate(MAX_FIELD_ERRORS);
         errors
     }
@@ -215,6 +305,20 @@ impl Policy {
             *n = canonical_network(n)?.to_string();
             ensure!(seen.insert(n.clone()), "duplicate allow rule");
         }
+        let mut meta = BTreeMap::new();
+        for (key, m) in std::mem::take(&mut self.allow_meta) {
+            let key = canonical_network(&key)?.to_string();
+            ensure!(
+                seen.contains(&key),
+                "allow metadata for a network not in allow"
+            );
+            ensure!(
+                text_ok(&m.reason, 128) && text_ok(&m.created_by, 64) && m.expires_at != Some(0),
+                "invalid allow metadata"
+            );
+            ensure!(meta.insert(key, m).is_none(), "duplicate allow metadata");
+        }
+        self.allow_meta = meta;
         Ok(())
     }
 }
@@ -228,11 +332,20 @@ pub struct Candidate {
     pub first_seen: u64,
     pub last_seen: u64,
     pub asn: Option<u32>,
+    /// Per-signal event counts in the current window.
+    #[serde(default)]
+    pub signals: history::SignalCounts,
+    /// GeoIP country, filled by the server when a country database is loaded.
+    #[serde(default)]
+    pub country: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Aggregate {
     pub ip: String,
     pub buckets: BTreeMap<u64, (u64, u64)>,
+    /// Per-signal counts per bucket (absent for pre-upgrade checkpoints).
+    #[serde(default)]
+    pub signals: BTreeMap<u64, history::SignalCounts>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct State {
@@ -243,6 +356,11 @@ pub struct State {
     pub stats: Stats,
     #[serde(default)]
     pub rules: RuleSet,
+    #[serde(default)]
+    pub block_origins: BTreeMap<String, BlockOrigin>,
+    /// Lua source that produced `rules`, when rules were applied from Lua.
+    #[serde(default)]
+    pub rules_script: Option<String>,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Stats {
@@ -254,7 +372,7 @@ pub struct Stats {
 pub struct IngestResult {
     pub accepted: usize,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AsnPrefix {
     pub network: String,
     pub asn: u32,
@@ -270,12 +388,16 @@ pub struct Engine {
     aggregates: BTreeMap<String, Aggregate>,
     stats: Stats,
     asns: Arc<PrefixTrie<u32>>,
-    allow_index: PrefixTrie<()>,
+    allow_index: PrefixTrie<u64>,
     block_index: PrefixTrie<Arc<Block>>,
     last_pruned: Option<u64>,
     snapshot_bytes: usize,
     rules: RuleSet,
     compiled_rules: Arc<CompiledRules>,
+    rules_sequence: u64,
+    rules_script: Option<String>,
+    asn_catalog: Arc<Vec<AsnPrefix>>,
+    history: Arc<std::sync::Mutex<history::SignalHistory>>,
 }
 impl Engine {
     pub fn new(mut policy: Policy) -> Result<Self> {
@@ -284,10 +406,7 @@ impl Engine {
             snapshot_budget(&policy, std::iter::empty()) <= 4_000_000,
             "policy snapshot byte budget exceeded"
         );
-        let mut allow_index = PrefixTrie::default();
-        for n in &policy.allow {
-            allow_index.insert(canonical_network(n)?, ());
-        }
+        let allow_index = allow_trie(&policy)?;
         let snapshot_bytes = snapshot_budget(&policy, std::iter::empty());
         let mut epoch = [0u8; 32];
         getrandom::getrandom(&mut epoch)
@@ -307,7 +426,54 @@ impl Engine {
             snapshot_bytes,
             rules: RuleSet::default(),
             compiled_rules: Arc::new(CompiledRules::default()),
+            rules_sequence: 1,
+            rules_script: None,
+            asn_catalog: Arc::new(Vec::new()),
+            history: Arc::new(std::sync::Mutex::new(history::SignalHistory::new(
+                history::DEFAULT_RETENTION_SECS,
+            ))),
         })
+    }
+    /// Opaque rules revision (`epoch:r<sequence>`), changed by every rules write
+    /// and across restarts, for rules compare-and-set.
+    pub fn rules_revision(&self) -> String {
+        format!("{}:r{}", self.policy_epoch, self.rules_sequence)
+    }
+    /// Lua source of the active rules, when they were applied from Lua.
+    pub fn rules_script(&self) -> Option<&str> {
+        self.rules_script.as_deref()
+    }
+    /// Apply rules compiled from `script`, retaining the bounded source text.
+    pub fn set_rules_from_script(&mut self, rules: RuleSet, script: String) -> Result<()> {
+        ensure!(script.len() <= 32 * 1024, "Lua script exceeds 32 KiB");
+        self.set_rules(rules)?;
+        self.rules_script = Some(script);
+        Ok(())
+    }
+    /// Offline ASN catalog prefixes (canonical, sorted by ASN then network).
+    pub fn asn_catalog(&self) -> &[AsnPrefix] {
+        &self.asn_catalog
+    }
+    /// Shared bounded per-address signal history.
+    pub fn history(&self) -> Arc<std::sync::Mutex<history::SignalHistory>> {
+        self.history.clone()
+    }
+    pub fn set_history(&mut self, h: Arc<std::sync::Mutex<history::SignalHistory>>) {
+        self.history = h;
+    }
+    /// Keep existing allow metadata for entries still present when a policy
+    /// write (legacy clients) omits `allow_meta`, so expiries are never lost.
+    pub fn carry_allow_meta(&self, policy: &mut Policy) {
+        if !policy.allow_meta.is_empty() {
+            return;
+        }
+        for n in &policy.allow {
+            if let Ok(key) = canonical_network(n).map(|k| k.to_string())
+                && let Some(m) = self.policy.allow_meta.get(&key)
+            {
+                policy.allow_meta.insert(key, m.clone());
+            }
+        }
     }
     pub fn policy(&self) -> &Policy {
         &self.policy
@@ -340,10 +506,7 @@ impl Engine {
     }
     pub fn set_policy(&mut self, mut policy: Policy) -> Result<()> {
         policy.validate()?;
-        let mut allow_index = PrefixTrie::default();
-        for n in &policy.allow {
-            allow_index.insert(canonical_network(n)?, ());
-        }
+        let allow_index = allow_trie(&policy)?;
         ensure!(
             snapshot_budget(&policy, self.blocks.values().map(AsRef::as_ref)) <= 4_000_000,
             "snapshot byte budget exceeded"
@@ -372,6 +535,7 @@ impl Engine {
         let window = self.policy.window_secs;
         self.aggregates.retain(|_, a| {
             a.buckets.retain(|t, _| *t <= now && now - *t < window);
+            a.signals.retain(|t, _| *t <= now && now - *t < window);
             !a.buckets.is_empty()
         });
         self.blocks.retain(|_, b| {
@@ -386,8 +550,8 @@ impl Engine {
             }
         });
     }
-    fn allowed(&self, ip: IpAddr) -> bool {
-        self.allow_index.longest(ip).is_some()
+    fn allowed(&self, ip: IpAddr, now: u64) -> bool {
+        self.allow_index.longest_where(ip, |e| *e > now).is_some()
     }
     pub fn ingest(&mut self, batch: EventBatch, now: u64) -> Result<IngestResult> {
         ensure!(
@@ -409,7 +573,7 @@ impl Engine {
         self.prune(now);
         let mut accepted = 0;
         for (e, ip) in batch.events.into_iter().zip(parsed) {
-            if self.allowed(ip) || self.decision(&ip.to_string(), now)?.action == "deny" {
+            if self.allowed(ip, now) || self.decision(&ip.to_string(), now)?.action == "deny" {
                 continue;
             }
             let weight = match e.kind {
@@ -432,16 +596,17 @@ impl Engine {
                 .or_insert_with(|| Aggregate {
                     ip: key.clone(),
                     buckets: BTreeMap::new(),
+                    signals: BTreeMap::new(),
                 });
-            let b = a
-                .buckets
-                .entry(
-                    now / self.policy.window_secs.div_ceil(64)
-                        * self.policy.window_secs.div_ceil(64),
-                )
-                .or_default();
+            let slot =
+                now / self.policy.window_secs.div_ceil(64) * self.policy.window_secs.div_ceil(64);
+            let b = a.buckets.entry(slot).or_default();
             b.0 = b.0.saturating_add(weight);
             b.1 = b.1.saturating_add(1);
+            a.signals.entry(slot).or_default().add(e.kind, 1);
+            if let Ok(mut h) = self.history.lock() {
+                h.record(ip, e.kind, weight, now);
+            }
             let score = a.buckets.values().fold(0u64, |s, b| s.saturating_add(b.0));
             accepted += 1;
             if score >= self.policy.threshold
@@ -454,7 +619,12 @@ impl Engine {
                         Block {
                             network: exact(ip),
                             expires_at: now.saturating_add(self.policy.block_ttl_secs),
-                            reason: "automatic threshold".into(),
+                            reason: trace::AUTOMATIC_BLOCK_REASON.into(),
+                            origin: BlockOrigin {
+                                source: BlockSource::Auto,
+                                created_at: Some(now),
+                                created_by: None,
+                            },
                         },
                         now,
                     );
@@ -479,7 +649,20 @@ impl Engine {
             generated_at: now,
             valid_until: now.saturating_add(30),
             mode: self.policy.mode,
-            allow: self.policy.allow.clone(),
+            // Expired allow entries are omitted; snapshot clients cannot expire them.
+            allow: self
+                .policy
+                .allow
+                .iter()
+                .filter(|n| {
+                    self.policy
+                        .allow_meta
+                        .get(*n)
+                        .and_then(|m| m.expires_at)
+                        .is_none_or(|e| e > now)
+                })
+                .cloned()
+                .collect(),
             blocks: self.blocks.values().map(|b| b.as_ref().clone()).collect(),
         }
     }
@@ -517,6 +700,14 @@ impl Engine {
                     first_seen: a.buckets.first_key_value().map_or(now, |(t, _)| *t),
                     last_seen: a.buckets.last_key_value().map_or(now, |(t, _)| *t),
                     asn: ip.and_then(|ip| self.asns.longest(ip).copied()),
+                    signals: a.signals.values().fold(
+                        history::SignalCounts::default(),
+                        |mut s, c| {
+                            s.merge(c);
+                            s
+                        },
+                    ),
+                    country: None,
                 }
             })
             .collect()
@@ -525,6 +716,14 @@ impl Engine {
         self.prune(now);
         block.network = canonical_network(&block.network)?.to_string();
         ensure!(block.reason.len() <= 128, "reason exceeds 128 bytes");
+        ensure!(
+            block
+                .origin
+                .created_by
+                .as_ref()
+                .is_none_or(|v| v.len() <= 64),
+            "created_by exceeds 64 bytes"
+        );
         ensure!(
             block.expires_at > now && block.expires_at - now <= 604800,
             "invalid block expiry"
@@ -566,13 +765,17 @@ impl Engine {
         Ok(removed)
     }
     pub fn approve(&mut self, ip: &str, now: u64) -> Result<Block> {
+        self.approve_as(ip, now, None)
+    }
+    /// Approve a candidate, recording the approving actor in the block origin.
+    pub fn approve_as(&mut self, ip: &str, now: u64, by: Option<&str>) -> Result<Block> {
         self.prune(now);
         let ip = canonical_ip(ip)?;
         ensure!(
             self.aggregates.contains_key(&ip.to_string()),
             "candidate not found"
         );
-        ensure!(!self.allowed(ip), "candidate is allowlisted");
+        ensure!(!self.allowed(ip, now), "candidate is allowlisted");
         ensure!(
             self.aggregates[&ip.to_string()]
                 .buckets
@@ -584,7 +787,12 @@ impl Engine {
         let block = Block {
             network: exact(ip),
             expires_at: now.saturating_add(self.policy.block_ttl_secs),
-            reason: "manual candidate approval".into(),
+            reason: trace::APPROVED_BLOCK_REASON.into(),
+            origin: BlockOrigin {
+                source: BlockSource::Approved,
+                created_at: Some(now),
+                created_by: by.map(|b| b.chars().take(64).collect()),
+            },
         };
         self.add_block(block.clone(), now)?;
         Ok(block)
@@ -592,6 +800,7 @@ impl Engine {
     pub fn set_asn_catalog(&mut self, prefixes: Vec<AsnPrefix>) -> Result<()> {
         ensure!(prefixes.len() <= MAX_BLOCKS, "ASN catalog exceeds capacity");
         let mut values = PrefixTrie::default();
+        let mut listed = Vec::with_capacity(prefixes.len());
         for p in prefixes {
             ensure!(p.asn > 0, "invalid ASN");
             let network = canonical_network(&p.network)?;
@@ -599,8 +808,14 @@ impl Engine {
                 values.insert(network, p.asn).is_none(),
                 "duplicate ASN prefix"
             );
+            listed.push(AsnPrefix {
+                network: network.to_string(),
+                asn: p.asn,
+            });
         }
+        listed.sort_by(|a, b| a.asn.cmp(&b.asn).then_with(|| a.network.cmp(&b.network)));
         self.asns = Arc::new(values);
+        self.asn_catalog = Arc::new(listed);
         self.revision = self.revision.saturating_add(1);
         Ok(())
     }
@@ -612,6 +827,13 @@ impl Engine {
             aggregates: self.aggregates.values().cloned().collect(),
             stats: self.stats.clone(),
             rules: self.rules.clone(),
+            block_origins: self
+                .blocks
+                .iter()
+                .filter(|(_, b)| b.origin != BlockOrigin::default())
+                .map(|(k, b)| (k.clone(), b.origin.clone()))
+                .collect(),
+            rules_script: self.rules_script.clone(),
         }
     }
     pub fn restore(state: State) -> Result<Self> {
@@ -624,10 +846,24 @@ impl Engine {
         engine.stats = state.stats;
         let revision = engine.revision;
         engine.set_rules(state.rules)?;
+        ensure!(
+            state
+                .rules_script
+                .as_ref()
+                .is_none_or(|s| s.len() <= 32 * 1024),
+            "stored Lua source exceeds 32 KiB"
+        );
+        engine.rules_script = state.rules_script;
         engine.revision = revision;
+        let mut origins = state.block_origins;
         for mut b in state.blocks {
             b.network = canonical_network(&b.network)?.to_string();
             ensure!(b.reason.len() <= 128, "invalid reason");
+            b.origin = origins.remove(&b.network).unwrap_or_default();
+            ensure!(
+                b.origin.created_by.as_ref().is_none_or(|v| v.len() <= 64),
+                "invalid block origin"
+            );
             let b = Arc::new(b);
             engine
                 .block_index
@@ -639,7 +875,10 @@ impl Engine {
         }
         for mut a in state.aggregates {
             a.ip = canonical_ip(&a.ip)?.to_string();
-            ensure!(a.buckets.len() <= 64, "aggregate exceeds window capacity");
+            ensure!(
+                a.buckets.len() <= 64 && a.signals.len() <= 64,
+                "aggregate exceeds window capacity"
+            );
             ensure!(
                 engine.aggregates.insert(a.ip.clone(), a).is_none(),
                 "duplicate aggregate"
@@ -820,6 +1059,7 @@ mod tests {
                 network: "192.0.2.19/24".into(),
                 expires_at: 200,
                 reason: "test".into(),
+                ..Default::default()
             },
             100,
         )
@@ -879,6 +1119,7 @@ mod tests {
                 network: "2001:db8::123/32".into(),
                 expires_at: 200,
                 reason: "ipv6".into(),
+                ..Default::default()
             },
             100,
         )
@@ -902,7 +1143,7 @@ pub struct Decision {
 pub struct DecisionView {
     pub revision: u64,
     pub mode: Mode,
-    allow: PrefixTrie<()>,
+    allow: PrefixTrie<u64>,
     blocks: PrefixTrie<Arc<Block>>,
     rules: Arc<CompiledRules>,
     asns: Arc<PrefixTrie<u32>>,
@@ -997,11 +1238,7 @@ impl DecisionView {
     pub fn with_candidate(&self, policy: Option<&Policy>, rules: Option<&RuleSet>) -> Result<Self> {
         let mut view = self.clone();
         if let Some(policy) = policy {
-            let mut allow = PrefixTrie::default();
-            for n in &policy.allow {
-                allow.insert(canonical_network(n)?, ());
-            }
-            view.allow = allow;
+            view.allow = allow_trie(policy)?;
             view.mode = policy.mode;
         }
         if let Some(rules) = rules {
@@ -1108,6 +1345,7 @@ mod bounded_tests {
                 network: "203.0.113.0/24".into(),
                 expires_at: 103,
                 reason: "manual".into(),
+                ..Default::default()
             },
             100,
         )
@@ -1124,6 +1362,7 @@ mod bounded_tests {
             network: "203.0.113.4/32".into(),
             expires_at: 100,
             reason: "\0".repeat(128),
+            ..Default::default()
         };
         assert!(block_cost(&b) > 768);
     }
@@ -1210,7 +1449,7 @@ mod asn_index_tests {
 #[allow(clippy::too_many_arguments)]
 #[inline]
 fn query_rules<'a>(
-    allow: &PrefixTrie<()>,
+    allow: &PrefixTrie<u64>,
     blocks: &'a PrefixTrie<Arc<Block>>,
     rules: &'a CompiledRules,
     catalog: &PrefixTrie<u32>,
@@ -1239,7 +1478,7 @@ fn query_rules<'a>(
 #[allow(clippy::too_many_arguments)]
 #[inline]
 fn evaluate<'a, T: Tracer<'a>>(
-    allow: &PrefixTrie<()>,
+    allow: &PrefixTrie<u64>,
     blocks: &'a PrefixTrie<Arc<Block>>,
     rules: &'a CompiledRules,
     catalog: &PrefixTrie<u32>,
@@ -1265,7 +1504,7 @@ fn evaluate<'a, T: Tracer<'a>>(
         });
         return d;
     }
-    let allowed = allow.longest_prefix_where(ip, |_| true);
+    let allowed = allow.longest_prefix_where(ip, |expires| *expires > now);
     trace.event(TraceEvent::Allowlist {
         prefix_len: allowed.map(|(bits, _)| bits),
     });
@@ -1385,7 +1624,12 @@ impl Engine {
     pub fn set_rules(&mut self, mut rules: RuleSet) -> Result<()> {
         rules.validate()?;
         let compiled = CompiledRules::new(&rules)?;
+        self.rules_sequence = self
+            .rules_sequence
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("rules revision exhausted"))?;
         self.rules = rules;
+        self.rules_script = None;
         self.compiled_rules = Arc::new(compiled);
         self.revision = self.revision.saturating_add(1);
         Ok(())
@@ -1592,6 +1836,7 @@ mod explain_support_tests {
                 network: "203.0.113.0/24".into(),
                 expires_at: 1000,
                 reason: trace::AUTOMATIC_BLOCK_REASON.into(),
+                ..Default::default()
             },
             100,
         )
@@ -1628,5 +1873,152 @@ mod explain_support_tests {
         ] {
             assert!(reasons::DECISION_CODES.contains(&code));
         }
+    }
+}
+
+#[cfg(test)]
+mod console_gap_tests {
+    use super::*;
+    use trace::{DecidingStage, Evidence, reason_code};
+    fn batch(ip: &str, kind: EventKind, now: u64) -> EventBatch {
+        EventBatch {
+            source_id: "t".into(),
+            events: vec![Event {
+                ip: ip.into(),
+                kind,
+                observed_at: now,
+            }],
+        }
+    }
+    #[test]
+    fn allow_entries_expire_on_lookup_snapshot_and_survive_legacy_writes() {
+        let mut policy = Policy {
+            mode: Mode::Enforce,
+            allow: vec!["192.0.2.0/24".into(), "198.51.100.1/32".into()],
+            ..Policy::default()
+        };
+        policy.allow_meta.insert(
+            "192.0.2.9/24".into(),
+            AllowMeta {
+                expires_at: Some(200),
+                reason: Some("temporary".into()),
+                ..Default::default()
+            },
+        );
+        let mut e = Engine::new(policy).unwrap();
+        assert!(e.policy().allow_meta.contains_key("192.0.2.0/24"));
+        e.add_block(
+            Block {
+                network: "192.0.2.0/24".into(),
+                expires_at: 1000,
+                reason: "x".into(),
+                ..Default::default()
+            },
+            100,
+        )
+        .unwrap();
+        assert_eq!(e.decision("192.0.2.1", 150).unwrap().action, "allow");
+        assert_eq!(e.decision("192.0.2.1", 200).unwrap().action, "deny");
+        assert_eq!(e.snapshot(150).allow.len(), 2);
+        assert_eq!(e.snapshot(250).allow, ["198.51.100.1/32"]);
+        // A legacy write without allow_meta keeps metadata of retained entries.
+        let mut legacy = e.policy().clone();
+        legacy.allow_meta.clear();
+        legacy.threshold = 20;
+        e.carry_allow_meta(&mut legacy);
+        e.set_policy(legacy).unwrap();
+        assert_eq!(e.policy().allow_meta["192.0.2.0/24"].expires_at, Some(200));
+        let mut orphan = e.policy().clone();
+        orphan
+            .allow_meta
+            .insert("203.0.113.0/24".into(), AllowMeta::default());
+        assert!(orphan.clone().validate().is_err());
+        assert_eq!(orphan.diagnose()[0].path, "/allow_meta/203.0.113.0~124");
+    }
+    #[test]
+    fn block_origin_persists_and_decides_reason_code() {
+        let mut e = Engine::new(Policy {
+            mode: Mode::Enforce,
+            auto_block: true,
+            ..Policy::default()
+        })
+        .unwrap();
+        e.add_block(
+            Block {
+                network: "203.0.113.0/24".into(),
+                expires_at: 1000,
+                reason: "automatic threshold".into(),
+                origin: BlockOrigin {
+                    source: BlockSource::Manual,
+                    created_at: Some(100),
+                    created_by: Some("operator".into()),
+                },
+            },
+            100,
+        )
+        .unwrap();
+        e.ingest(batch("198.51.100.7", EventKind::Honeypot, 100), 100)
+            .unwrap();
+        let r = Engine::restore(e.state()).unwrap();
+        let origin = |n: &str| r.blocks().find(|b| b.network == n).unwrap().origin.clone();
+        assert_eq!(
+            origin("203.0.113.0/24").created_by.as_deref(),
+            Some("operator")
+        );
+        assert_eq!(origin("198.51.100.7/32").source, BlockSource::Auto);
+        let view = r.decision_view();
+        let code = |ip: &str| {
+            let mut ev = Evidence::default();
+            view.evaluate(ip.parse().unwrap(), 150, GeoContext::default(), &mut ev);
+            reason_code(
+                ev.stage.unwrap_or(DecidingStage::Default),
+                ev.winner,
+                ev.block,
+            )
+        };
+        // Manual source wins over a reason string that looks automatic.
+        assert_eq!(code("203.0.113.1"), "sumunjang.deny.block_manual");
+        assert_eq!(code("198.51.100.7"), "sumunjang.deny.block_automatic");
+        // Snapshot wire shape has no origin.
+        let wire = serde_json::to_value(r.clone().snapshot(150)).unwrap();
+        assert!(wire["blocks"][0].get("origin").is_none());
+    }
+    #[test]
+    fn rules_revision_script_signals_and_asn_catalog() {
+        let mut e = Engine::new(Policy::default()).unwrap();
+        let r0 = e.rules_revision();
+        e.set_rules_from_script(RuleSet::default(), "return {version=1,rules={}}".into())
+            .unwrap();
+        assert_ne!(e.rules_revision(), r0);
+        assert!(e.rules_script().is_some());
+        let restored = Engine::restore(e.state()).unwrap();
+        assert_eq!(restored.rules_script(), e.rules_script());
+        assert_ne!(restored.rules_revision(), e.rules_revision());
+        e.set_rules(RuleSet::default()).unwrap();
+        assert!(e.rules_script().is_none());
+        for kind in [EventKind::Honeypot, EventKind::Scanner, EventKind::Scanner] {
+            e.ingest(batch("192.0.2.5", kind, 100), 100).unwrap();
+        }
+        let c = &e.candidates(100)[0];
+        assert_eq!((c.signals.honeypot, c.signals.scanner, c.events), (1, 2, 3));
+        let h = e.history();
+        let series = h
+            .lock()
+            .unwrap()
+            .series("192.0.2.5".parse().unwrap(), 0, 200, 100);
+        assert_eq!((series.len(), series[0].score), (1, 20));
+        e.set_asn_catalog(vec![
+            AsnPrefix {
+                network: "198.51.100.9/24".into(),
+                asn: 2,
+            },
+            AsnPrefix {
+                network: "192.0.2.0/24".into(),
+                asn: 1,
+            },
+        ])
+        .unwrap();
+        assert_eq!(e.asn_catalog()[0].asn, 1);
+        assert_eq!(e.asn_catalog()[1].network, "198.51.100.0/24");
     }
 }

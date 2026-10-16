@@ -539,6 +539,7 @@ mod tests {
                 network: "192.0.2.0/24".into(),
                 expires_at: 200,
                 reason: "manual".into(),
+                ..Default::default()
             },
             100,
         )
