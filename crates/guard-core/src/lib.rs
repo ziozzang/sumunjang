@@ -379,6 +379,11 @@ pub struct State {
     pub rules_epoch: Option<String>,
     #[serde(default)]
     pub rules_sequence: Option<u64>,
+    /// Policy document revision lineage and sequence, persisted likewise.
+    #[serde(default)]
+    pub policy_epoch: Option<String>,
+    #[serde(default)]
+    pub policy_sequence: Option<u64>,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Stats {
@@ -871,6 +876,8 @@ impl Engine {
                 .collect(),
             rules_script: self.rules_script.clone(),
             rules_epoch: Some(self.rules_epoch.clone()),
+            policy_epoch: Some(self.policy_epoch.clone()),
+            policy_sequence: Some(self.policy_sequence),
             rules_sequence: Some(self.rules_sequence),
         }
     }
@@ -892,6 +899,14 @@ impl Engine {
             "stored Lua source exceeds 32 KiB"
         );
         engine.rules_script = state.rules_script;
+        if let (Some(epoch), Some(sequence)) = (state.policy_epoch, state.policy_sequence) {
+            ensure!(
+                epoch.len() == 64 && epoch.bytes().all(|b| b.is_ascii_hexdigit()) && sequence > 0,
+                "invalid stored policy revision"
+            );
+            engine.policy_epoch = epoch;
+            engine.policy_sequence = sequence;
+        }
         if let (Some(epoch), Some(sequence)) = (state.rules_epoch, state.rules_sequence) {
             ensure!(
                 epoch.len() == 64 && epoch.bytes().all(|b| b.is_ascii_hexdigit()) && sequence > 0,
@@ -1026,8 +1041,22 @@ mod tests {
         assert_eq!(e.policy_revision(), initial);
         e.set_policy(e.policy().clone()).unwrap();
         assert_ne!(e.policy_revision(), initial);
-        assert_ne!(
+        // Persisted lineage and sequence: restarts keep the revision.
+        assert_eq!(
             Engine::restore(e.state()).unwrap().policy_revision(),
+            e.policy_revision()
+        );
+        // Checkpoints without them (older versions) start a new lineage.
+        let mut old = e.state();
+        old.policy_epoch = None;
+        old.policy_sequence = None;
+        assert_ne!(
+            Engine::restore(old).unwrap().policy_revision(),
+            e.policy_revision()
+        );
+        // A different database lineage never matches.
+        assert_ne!(
+            Engine::new(e.policy().clone()).unwrap().policy_revision(),
             e.policy_revision()
         );
     }

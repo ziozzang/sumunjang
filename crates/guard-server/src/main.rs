@@ -2338,7 +2338,7 @@ mod tests {
         );
         let inner = a.inner.lock().unwrap();
         let restored = Engine::restore(inner.engine.state()).unwrap();
-        assert_ne!(restored.policy_revision(), inner.engine.policy_revision());
+        assert_eq!(restored.policy_revision(), inner.engine.policy_revision());
     }
     #[tokio::test]
     async fn policy_checkpoint_and_failure_rollback() {

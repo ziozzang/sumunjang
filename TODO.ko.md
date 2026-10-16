@@ -573,3 +573,6 @@ ASN 제안 흐름, 클라이언트 이전 후 무조건 룰 쓰기 제거.
 `allowlist.expire` 변경으로 정리한다. 이력은 메모리 전용이며 `in_memory`,
 `retained_since`를 보고한다. 룰 리비전(lineage+순번)은 저장되어 재시작 후에도 CAS가
 유지된다. 코어 43·no_alloc 2·서버 79개 테스트와 Clippy가 통과했다.
+
+정책 문서 리비전(lineage+순번)도 같은 방식으로 저장하여 정책·허용 목록 CAS도
+재시작 후 유지된다.

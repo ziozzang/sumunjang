@@ -95,6 +95,8 @@ fn main() {
                 rules_script: None,
                 rules_epoch: None,
                 rules_sequence: None,
+                policy_epoch: None,
+                policy_sequence: None,
                 policy: Policy {
                     mode: Mode::Enforce,
                     ..Policy::default()

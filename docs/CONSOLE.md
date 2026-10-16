@@ -47,7 +47,13 @@ lock. A stale revision returns HTTP 409 without changing state; the UI retains
 the draft and requires an explicit reload/reconciliation. Allowlist saves use the
 loaded document revision too, without a fresh GET followed by an unguarded PUT.
 Revisions change on every successful policy replacement, including native legacy
-writes, and across restarts/restores; unrelated observations do not change them.
+writes; unrelated observations do not change them. The revision
+(`<lineage>:<sequence>`) is persisted in the checkpoint, so a restart keeps it
+and console compare-and-set on policy and allowlist does not spuriously
+conflict. The random lineage belongs to the database, so revisions from another
+server or a fresh database never match. Restoring an older checkpoint rolls the
+sequence back with its policy; reload after restores. Checkpoints written by
+older versions start a new lineage once.
 
 Legacy `GET/PUT /v1/policy` retain their original bare Policy wire format and
 unconditional write semantics for native clients. Those clients remain exposed

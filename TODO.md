@@ -647,3 +647,6 @@ evidence window; expired allow entries stay visible for 30 days
 `allowlist.expire` change; history stays in memory and reports `in_memory` and
 `retained_since`; the rules revision (lineage + sequence) is persisted so CAS
 survives restarts. Core 43 + no_alloc 2 and server 79 tests and Clippy pass.
+
+The policy document revision (lineage + sequence) is now persisted the same
+way, so policy and allowlist compare-and-set also survive restarts.

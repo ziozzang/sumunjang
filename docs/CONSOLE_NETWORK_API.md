@@ -69,7 +69,8 @@ server or a freshly created database (whose sequence restarts at 1) from
 matching. Restoring an older checkpoint backup rolls the sequence back with the
 rules it describes; clients holding a newer revision get 409 until it is
 exceeded again, so reload after restores. Checkpoints written before this change
-start a new lineage once.
+start a new lineage once. The policy document revision (also used by
+`/v1/allowlist`) is persisted the same way.
 
 ## Change reasons
 
