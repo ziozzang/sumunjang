@@ -64,3 +64,15 @@ errors, and invalid acknowledgements retain drafts and disable both save actions
 Only an explicit successful fresh policy reload clears that uncertainty; reload
 replaces the draft, so copy any local changes needed for reconciliation first.
 A 409 retains the draft and is never retried automatically.
+
+## Audit and explain routes (package 0.1.5)
+
+Package 0.1.5 declares read-only broker routes `audit` (GET), `audit/query`,
+`explain`, `explain/batch` (POST, `mutation: false`) and `reasons` (GET); assets
+and UI are unchanged. Deploy the backend first, then review and repin the new
+manifest. The broker forwards no query strings, so console audit filters and
+cursors use `POST audit/query`. To record the console administrator instead of
+the shared credential, set `"delegate_actor": true` and
+`"delegation_authority": "hangang"` on the Guard binding with the Guard admin
+credential (≥ 32 bytes) as `token_env`; Sumunjang verifies the signed actor
+assertion and refuses invalid ones. See [audit and explain](AUDIT_EXPLAIN.md).

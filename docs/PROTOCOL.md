@@ -80,3 +80,10 @@ qualification are follow-up work. HTTP management/evidence listeners are
 unchanged by these native TLS flags; use the existing local broker or a
 separately authenticated TLS ingress for remote HTTP access. This change does
 not establish replica membership or measured full-stack TLS throughput.
+
+## Decision evidence is not carried by HGD1
+
+The 24-byte frames above are unchanged. Matched rule IDs, ASN, country and
+reason codes are available only through the additive gRPC
+`include_evidence` flag and HTTP `/v1/decision` `"evidence": true`; see
+[gRPC](GRPC.md) and [audit and explain](AUDIT_EXPLAIN.md).

@@ -117,6 +117,9 @@ GeoIP 온라인 갱신·세부 운영 정책, LLM 검토 보조는 다음 단계
 
 [업데이트 신뢰 모델과 lifecycle](docs/ko/UPDATES.md)
 
+[정책 변경 감사·explain/what-if·판정 근거](docs/ko/AUDIT_EXPLAIN.md):
+`GET /v1/audit`, `POST /v1/explain`, `POST /v1/explain/batch`, gRPC/HTTP 근거.
+
 [Hangang 네이티브 Guard 메뉴](docs/ko/CONSOLE.md)는 host 인증 위임과 해시가 고정된 패키지를 사용합니다.
 
 추가 [gRPC 판정](docs/ko/GRPC.md)은 공용 서버 런타임을 사용하며 빌드에 `protoc`가 필요합니다.

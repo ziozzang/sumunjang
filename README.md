@@ -128,6 +128,9 @@ and [design](docs/DESIGN.md) for the delivery procedure.
 
 [Update trust model and lifecycle](docs/UPDATES.md)
 
+[Policy-change audit, explain/what-if and decision evidence](docs/AUDIT_EXPLAIN.md):
+`GET /v1/audit`, `POST /v1/explain`, `POST /v1/explain/batch`, gRPC/HTTP evidence.
+
 Use [Guard in the native Hangang console](docs/CONSOLE.md) with delegated host authentication and a pinned package.
 
 Additional [gRPC decisions](docs/GRPC.md) reuse the shared server runtime; building requires `protoc`.

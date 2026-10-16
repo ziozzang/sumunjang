@@ -59,6 +59,8 @@ force independently. A guard allowlist only exempts an IP from guard blocking.
   Durable storage holds policy and compact candidate aggregates, never all logs.
 - Checkpoints are SQLite transactions. Admin success requires durable policy
   persistence; candidate counts may lose at most one checkpoint interval on crash.
+  The policy-change audit row commits in the same transaction, so a change
+  cannot become durable without its audit record (AUDIT_EXPLAIN.md).
 
 ## Resource and performance goals
 Default maximum tracked IPs: 10,000; maximum block entries: 100,000; event batch:
@@ -105,6 +107,9 @@ Admin endpoints (admin bearer only):
 - GET /v1/blocks: active Block array; POST /v1/blocks: Block;
   DELETE /v1/blocks: {network: CIDR}.
 - POST /v1/candidates/approve: {ip: IP string}; approve an exact-IP block.
+- GET /v1/audit, POST /v1/audit/query: policy-change audit (filters, cursor).
+- POST /v1/explain, POST /v1/explain/batch, GET /v1/reasons: explain/what-if on
+  the live evaluation path and the reason catalog. See AUDIT_EXPLAIN.md.
 - Dashboard /: static HTML, credential entered in browser memory only; no local
   storage, embedded token, external scripts or unsanitized evidence HTML.
 

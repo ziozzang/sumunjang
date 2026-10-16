@@ -36,7 +36,7 @@ guard를 비동기 질의합니다. 판단은 메모리에서 수행하며 DB/AS
 - ASN은 분류 정보이며 악성 증거가 아닙니다. 운영자 제공 오프라인 prefix catalog를 지원하고 ASN 전체 차단은 명시적 수동 승인이 필요합니다. LLM은 허용 목록 변경/범위 확대 권한이 없습니다.
 - 정책은 검증된 bounded 전체 view를 원자 교체합니다. Snapshot poll 실패 시 valid_until까지 마지막 정상 정책을 유지한 뒤 fail-open합니다. Query 기본 timeout은 100ms, fail-deny 503이며 명시적 fail-allow를 선택할 수 있습니다. 기존 방어는 유지합니다. 재시작하면 revision이 초기화될 수 있어 generated_at/유효 기간으로 신선도를 판단합니다.
 - 입력/이벤트/후보/차단/룰/prefix/body는 제한합니다. Overflow는 카운터에 표시하고 이벤트 전송 때문에 proxy를 대기시키지 않습니다. 영속 저장에는 정책과 압축 집계만 저장합니다.
-- Checkpoint는 SQLite transaction입니다. 관리자 성공은 영속 정책 저장 이후이며 crash 시 집계는 최대 checkpoint 간격만큼 유실될 수 있습니다.
+- Checkpoint는 SQLite transaction입니다. 관리자 성공은 영속 정책 저장 이후이며 crash 시 집계는 최대 checkpoint 간격만큼 유실될 수 있습니다. 정책 변경 감사 행은 같은 transaction에서 반영되므로 감사 기록 없이 변경이 영속되지 않습니다(AUDIT_EXPLAIN.md).
 
 ## 자원·성능 목표
 
@@ -73,6 +73,8 @@ Admin API:
 - `GET/PUT /v1/policy`: 정책 조회/변경.
 - `GET /v1/blocks`: 활성 block 목록; `POST /v1/blocks`: block 추가; `DELETE /v1/blocks`: `{network}` 삭제.
 - `POST /v1/candidates/approve`: `{ip}`로 정확한 IP 차단 승인.
+- `GET /v1/audit`, `POST /v1/audit/query`: 정책 변경 감사(필터, 커서).
+- `POST /v1/explain`, `POST /v1/explain/batch`, `GET /v1/reasons`: 실시간 평가 경로의 explain/what-if와 사유 카탈로그. AUDIT_EXPLAIN.md 참고.
 - `/`: 정적 대시보드; 토큰은 브라우저 메모리만 사용하고 local storage/내장 토큰/외부 스크립트/비정제 evidence HTML은 없습니다.
 
 Policy: `{mode, auto_block, window_secs, threshold, block_ttl_secs, allow,

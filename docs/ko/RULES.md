@@ -98,3 +98,11 @@ MMDB 구조/타입 검증, 열린 일반 파일과 제한된 읽기를 적용합
 
 MMDB ASN이 누락되면 오프라인 `--asn-catalog` prefix를 사용합니다. 명시적 MMDB
 ASN이 우선합니다. 관리자 조회와 화면에는 실제 적용 ASN 및 fallback을 표시합니다.
+
+## Explain과 후보 룰
+
+`POST /v1/explain`은 한 주소의 모드·허용 목록·GeoIP/ASN·일치/만료 룰·차단 조회·최종
+사유 코드를 게시 룰 또는 후보 `rules`/`script`에 대해 추적한다. 후보는
+`PUT /v1/rules`/`PUT /v1/rules/lua`와 같이 검증하지만 저장하지 않는다.
+`POST /v1/explain/batch`는 후보가 최대 1,024개 주소의 판정을 얼마나 바꾸는지
+센다. [감사·explain](AUDIT_EXPLAIN.md) 참고.

@@ -43,3 +43,20 @@ Check는 판정 전에 정확한 불변 정책 view와 필요한 경우 GeoIP �
 후보를 버리고 unavailable/미지정 모드/TTL 0을 반환합니다. TTL은 최대 5초입니다.
 두 소유자 교체와 기존 호출자/수용량/리비전 하한 검사를 수행합니다. 로컬 응답 경계이며
 서명 네트워크 receipt나 분산 소유권 lease가 아닙니다. 품계 receipt/permit 연결은 별도입니다.
+
+## 판정 근거(추가 필드)
+
+`NetworkRequest.include_evidence`(필드 4)를 켜면 `NetworkReply.evidence`(필드 6,
+`NetworkEvidence`)를 받는다. 안정적인 `reason_code`(`sumunjang.*`, 카탈로그는
+`GET /v1/reasons`), `deciding_stage`(observe, allowlist, rule, block, default),
+우선순위 순 최대 8개의 일치 활성 `rule_ids`와 `rule_ids_truncated`, `block_network`,
+`asn`(0은 불명), `country`(빈 값은 불명), 같은 게시 뷰를 집행으로 평가한
+`enforce_verdict`/`enforce_reason_code`를 담는다. 판정·모드·리비전(ADR 0019 이벤트의
+정책 리비전)·TTL은 같은 소유자 확인을 거친 기존 실시간 평가 그대로다. 사용 불가
+응답에서는 `sumunjang.unavailable.revision_floor`, `.owner_replaced`, `.source`
+사유 코드만 담는다. 플래그가 없으면 응답이 바뀌지 않아 기존 클라이언트에 영향이
+없고, 필드 번호는 새로 추가되며 재사용하지 않는다. 가장 큰 근거 응답도 1KiB 인코딩
+한계 안이다(테스트). 관찰 모드에서는 두 번 평가하며 할당 없는 고정 크기 `Evidence`
+싱크를 쓴다. 플래그 없는 요청은 `NoTrace` 경로를 유지한다. HGD1은 바뀌지 않고 근거를
+싣지 않는다. 차단 네트워크는 주소이므로 이벤트 내보내기 측에서 가명화해야 한다.
+[감사·explain](AUDIT_EXPLAIN.md) 참고.

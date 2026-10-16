@@ -598,3 +598,27 @@ qualification passes English/Korean switching without remount, back/forward,
 390px layout without overflow, GET-only plugin requests, logout disposal and no
 page errors. No policy mutation was exercised. This is a console package change
 only; no server, cluster or enforcement change.
+
+## Policy-change audit, explain/what-if and decision evidence — 2026-10-16
+
+Owner APIs for zero-trust ADR 0019/0020 (branch `feat/audit-explain-api`, not
+deployed). Every admin mutation (policy and policy document, blocks, candidate
+approval, JSON/Lua rules, GeoIP reload, update check, Kubernetes authority
+content changes, startup imports) writes an audit row with actor, action,
+target, before/after digests, summary, result and revisions. Committed rows share
+the checkpoint transaction, so an audit failure refuses the change; refusals are
+recorded best-effort and update requests use a two-phase uncertain record.
+Retention is bounded by rows and days. `GET /v1/audit` and `POST /v1/audit/query`
+filter and paginate by cursor. A signed Hangang broker actor assertion is verified
+(HMAC under the admin credential, method/path/body/freshness/nonce) and an invalid
+one is refused. `POST /v1/explain` traces the published or a never-stored
+candidate policy/rules/Lua through the same evaluation function as live decisions;
+`POST /v1/explain/batch` reports impact for up to 1,024 addresses; `GET /v1/reasons`
+serves `sumunjang.*` en/ko catalogs. gRPC `include_evidence` and HTTP
+`"evidence": true` add rule IDs, ASN, country, reason code and the enforce outcome;
+HGD1 is unchanged. Console package 0.1.5 declares the read-only routes. Core 38 +
+no_alloc 2, server 72, update 16 tests and strict Clippy pass; a local real-process
+HTTP smoke passed. Open: Python gRPC smoke with the new field, Hangang client
+adoption of evidence and actor delegation for the Guard binding, console views,
+`NetworkZone` ownership (ADR 0021/0022), explain rate limits per actor and audit
+export/forwarding to the unified console store.

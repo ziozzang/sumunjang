@@ -109,3 +109,12 @@ is displayed when available and never interpreted as exact personal location.
 When ASN MMDB metadata is missing, configured offline `--asn-catalog` prefixes
 provide ASN rule context. Explicit MMDB ASN takes precedence. Admin inspection
 reports the effective ASN, and the dashboard displays that fallback.
+
+## Explain and candidate rules
+
+`POST /v1/explain` traces one address through mode, allowlist, geo/ASN, every
+matching and expired rule, the block lookup and the final reason code, for the
+published rules or a candidate `rules`/`script` that is validated like
+`PUT /v1/rules`/`PUT /v1/rules/lua` but never stored. `POST /v1/explain/batch`
+counts how a candidate changes up to 1,024 addresses. See
+[audit and explain](AUDIT_EXPLAIN.md).

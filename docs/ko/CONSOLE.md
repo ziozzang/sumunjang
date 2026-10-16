@@ -48,3 +48,14 @@ HTTP 409를 반환하며 화면은 초안을 유지합니다. 명시적으로 �
 저장 응답은 초안을 유지하고 두 저장 버튼을 잠급니다. 명시적으로 최신 저장 정책을
 다시 읽는 데 성공해야 잠금이 풀립니다. 다시 불러오기는 초안을 교체하므로 조정에
 필요한 변경은 먼저 복사하세요. 409도 초안을 유지하며 자동 재시도하지 않습니다.
+
+## 감사·explain 경로(패키지 0.1.5)
+
+패키지 0.1.5는 읽기 전용 브로커 경로 `audit`(GET), `audit/query`, `explain`,
+`explain/batch`(POST, `mutation: false`), `reasons`(GET)를 선언한다. 자산과 UI는
+바뀌지 않았다. 백엔드를 먼저 배포한 뒤 새 manifest를 검토하고 다시 고정한다.
+브로커는 쿼리 문자열을 전달하지 않으므로 콘솔의 감사 필터·커서는
+`POST audit/query`를 쓴다. 공유 자격 대신 콘솔 관리자를 기록하려면 Guard 바인딩에
+`"delegate_actor": true`, `"delegation_authority": "hangang"`을 두고 Guard 관리자
+자격(32바이트 이상)을 `token_env`로 지정한다. 수문장은 서명된 행위자 단언을
+검증하며 잘못된 단언은 거부한다. [감사·explain](AUDIT_EXPLAIN.md) 참고.

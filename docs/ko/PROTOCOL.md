@@ -73,3 +73,9 @@ Hangang 원격 HGD1 client 설정과 실제 두 프로세스 배포 검증은 �
 네이티브 TLS 옵션은 HTTP 관리/근거 리스너를 변경하지 않습니다. 원격 HTTP는 기존
 로컬 broker 또는 별도로 인증되는 TLS ingress를 사용합니다. 이 변경으로 복제 서버
 membership이나 전체 스택 TLS 처리량이 검증된 것은 아닙니다.
+
+## HGD1은 판정 근거를 싣지 않음
+
+위 24바이트 프레임은 바뀌지 않는다. 일치 룰 ID·ASN·국가·사유 코드는 추가된 gRPC
+`include_evidence` 플래그와 HTTP `/v1/decision`의 `"evidence": true`로만 제공한다.
+[gRPC](GRPC.md)와 [감사·explain](AUDIT_EXPLAIN.md) 참고.

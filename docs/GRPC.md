@@ -63,3 +63,23 @@ candidate and return unavailable/unspecified mode/zero TTL. TTL is capped at
 five seconds. Tests exercise both owner replacements and existing caller/quota/
 revision-floor gates. This is a local response fence, not a signed network receipt
 or distributed owner lease. Pumgye receipt/permit integration remains separate.
+
+## Decision evidence (additive)
+
+`NetworkRequest.include_evidence` (field 4) requests `NetworkReply.evidence`
+(field 6, `NetworkEvidence`): stable `reason_code` (`sumunjang.*`, catalogs at
+`GET /v1/reasons`), `deciding_stage` (observe, allowlist, rule, block, default),
+up to eight matching active `rule_ids` in precedence order with
+`rule_ids_truncated`, `block_network`, `asn` (0 unknown), `country` (empty
+unknown), and `enforce_verdict`/`enforce_reason_code` for the same published view
+evaluated as enforce. Verdict, mode, revision (the policy revision used by
+ADR 0019 events) and TTL are the unchanged live evaluation under the same owner
+fence. When the reply is unavailable, evidence carries only
+`sumunjang.unavailable.revision_floor`, `.owner_replaced` or `.source`. Without
+the flag replies are unchanged, so existing clients are unaffected; field numbers
+are new and never reused. The largest evidence reply stays under the 1 KiB
+encode bound (tested). Evidence requests evaluate twice in observe mode and use
+the fixed-size, allocation-free `Evidence` sink; requests without the flag keep
+the `NoTrace` path. HGD1 is unchanged and carries no evidence. Block networks are
+addresses: event exporters must pseudonymize them. See
+[audit and explain](AUDIT_EXPLAIN.md).
