@@ -495,6 +495,57 @@ pub fn rules_summary(before: &RuleSet, after: &RuleSet) -> String {
     parts.join("; ")
 }
 
+pub fn zones_summary(
+    before: &guard_core::zones::ZoneSet,
+    after: &guard_core::zones::ZoneSet,
+) -> String {
+    let added: Vec<String> = after
+        .zones
+        .keys()
+        .filter(|k| !before.zones.contains_key(*k))
+        .cloned()
+        .collect();
+    let removed: Vec<String> = before
+        .zones
+        .keys()
+        .filter(|k| !after.zones.contains_key(*k))
+        .cloned()
+        .collect();
+    let changed: Vec<String> = after
+        .zones
+        .iter()
+        .filter(|(k, z)| {
+            before.zones.get(*k).is_some_and(|o| {
+                o.prefixes != z.prefixes
+                    || o.display_name != z.display_name
+                    || o.description != z.description
+                    || o.owner != z.owner
+            })
+        })
+        .map(|(k, z)| {
+            let o = &before.zones[k];
+            format!(
+                "{k} (prefixes {} -> {})",
+                o.prefixes.len(),
+                z.prefixes.len()
+            )
+        })
+        .collect();
+    let mut parts = vec![format!(
+        "zones {} -> {} (revision {} -> {})",
+        before.zones.len(),
+        after.zones.len(),
+        before.revision,
+        after.revision
+    )];
+    for (label, ids) in [("added", added), ("removed", removed), ("changed", changed)] {
+        if !ids.is_empty() {
+            parts.push(format!("{label} {}", list(&ids)));
+        }
+    }
+    parts.join("; ")
+}
+
 pub fn blocks_summary<'a>(
     before: impl Iterator<Item = &'a Block>,
     after: impl Iterator<Item = &'a Block>,

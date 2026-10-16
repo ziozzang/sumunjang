@@ -1697,3 +1697,234 @@ async fn allowlist_writes_keep_evidence_and_expired_entries_are_pruned_with_audi
     assert_eq!(h["in_memory"], true);
     assert!(h["retained_since"].as_u64().unwrap() <= crate::now());
 }
+
+// ----- network zones -----
+
+async fn zones(a: &App) -> Value {
+    call(a, "GET", "/v1/zones", ADMIN, None).await.body
+}
+async fn upsert_zone(a: &App, zone: Value) -> Reply {
+    let rev = zones(a).await["revision"].clone();
+    call(
+        a,
+        "POST",
+        "/v1/zones",
+        ADMIN,
+        Some(json!({"expected_revision": rev, "zone": zone, "reason": "zone change"})),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn zones_crud_uses_compare_and_set_reason_and_audit() {
+    let a = app();
+    assert_eq!(zones(&a).await["revision"], 0);
+    assert_eq!(
+        call(&a, "GET", "/v1/zones", COLLECTOR, None).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    let r = upsert_zone(
+        &a,
+        json!({"id":"corp","display_name":"Corporate","owner":"netops","description":"HQ and VPN",
+        "prefixes":["10.0.0.1/8","2001:db8::/32"]}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(r.body["revision"], 1);
+    assert_eq!(
+        r.body["zones"][0]["prefixes"],
+        json!(["10.0.0.0/8", "2001:db8::/32"])
+    );
+    assert_eq!(r.body["zones"][0]["updated_by"], "admin-credential");
+    // Server-stamped provenance in the body is ignored and overwritten.
+    let r = upsert_zone(
+        &a,
+        json!({"id":"office","prefixes":["10.1.0.0/16"],"updated_by":"spoof"}),
+    )
+    .await;
+    assert_eq!(r.body["zones"][1]["updated_by"], "admin-credential");
+    // Stale revision → 409 with current revision, unchanged.
+    let stale = call(
+        &a,
+        "POST",
+        "/v1/zones",
+        ADMIN,
+        Some(json!({"expected_revision":1,"zone":{"id":"x","prefixes":["192.0.2.0/24"]}})),
+    )
+    .await;
+    assert_eq!(stale.status, StatusCode::CONFLICT);
+    assert_eq!(stale.body["current_revision"], "2");
+    // Validation paths.
+    let bad = upsert_zone(
+        &a,
+        json!({"id":"bad id","prefixes":["10.0.0.0/8","10.0.0.1/8","nope"]}),
+    )
+    .await;
+    assert_eq!(bad.status, StatusCode::BAD_REQUEST);
+    let paths: Vec<_> = bad.body["errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["path"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(paths, ["/zone/id", "/zone/prefixes/1", "/zone/prefixes/2"]);
+    assert_eq!(
+        upsert_zone(&a, json!({"id":"empty","prefixes":[]}))
+            .await
+            .status,
+        StatusCode::BAD_REQUEST
+    );
+    // Removal through POST {remove} (broker) and DELETE (direct API).
+    let rev = zones(&a).await["revision"].clone();
+    let r = call(
+        &a,
+        "POST",
+        "/v1/zones",
+        ADMIN,
+        Some(json!({"expected_revision":rev,"remove":"office","reason":"merged"})),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK);
+    let rev = r.body["revision"].clone();
+    assert_eq!(
+        call(
+            &a,
+            "DELETE",
+            "/v1/zones",
+            ADMIN,
+            Some(json!({"expected_revision":rev,"id":"office"}))
+        )
+        .await
+        .status,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        call(
+            &a,
+            "POST",
+            "/v1/zones",
+            ADMIN,
+            Some(json!({"expected_revision":rev}))
+        )
+        .await
+        .status,
+        StatusCode::BAD_REQUEST
+    );
+    let all = entries(&a, "?action=zones.*&limit=200").await;
+    let committed: Vec<_> = all.iter().filter(|e| e["result"] == "committed").collect();
+    assert_eq!(committed.len(), 3);
+    assert_eq!(committed[0]["action"], "zones.remove");
+    assert_eq!(committed[0]["reason"], "merged");
+    assert!(
+        committed[2]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("added corp")
+    );
+    assert_eq!(committed[2]["reason"], "zone change");
+    assert!(all.iter().any(|e| {
+        e["result"] == "refused"
+            && e["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("zone revision conflict")
+    }));
+    // Persisted with the checkpoint.
+    let body: String =
+        a.db.lock()
+            .unwrap()
+            .query_row("SELECT body FROM checkpoint WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+    let restored = guard_core::Engine::restore(serde_json::from_str(&body).unwrap()).unwrap();
+    assert_eq!(restored.zones().revision, 3);
+    assert!(restored.zones().zones.contains_key("corp"));
+}
+
+#[tokio::test]
+async fn zone_snapshot_matches_the_pumgye_contract_and_membership_is_reported() {
+    let a = app();
+    upsert_zone(
+        &a,
+        json!({"id":"corp","display_name":"Corporate","prefixes":["10.0.0.0/8"]}),
+    )
+    .await;
+    upsert_zone(
+        &a,
+        json!({"id":"legacy.reports.0","prefixes":["10.1.2.0/24","::ffff:192.0.2.0/120"]}),
+    )
+    .await;
+    let r = call(&a, "GET", "/v1/zones/snapshot", ADMIN, None).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(
+        r.body,
+        json!({"revision":2,"zones":{"corp":{"prefixes":["10.0.0.0/8"]},
+        "legacy.reports.0":{"prefixes":["10.1.2.0/24","192.0.2.0/24"]}}})
+    );
+    let lookup = call(
+        &a,
+        "POST",
+        "/v1/zones/lookup",
+        ADMIN,
+        Some(json!({"ip":"10.1.2.3"})),
+    )
+    .await
+    .body;
+    assert_eq!(lookup["zones"], json!(["corp", "legacy.reports.0"]));
+    assert_eq!(lookup["revision"], 2);
+    // Explain stage and HTTP evidence carry the same zones.
+    let e = call(
+        &a,
+        "POST",
+        "/v1/explain",
+        ADMIN,
+        Some(json!({"ip":"10.1.2.3"})),
+    )
+    .await
+    .body;
+    assert_eq!(e["stages"][1]["stage"], "zone");
+    assert_eq!(e["stages"][1]["zones"], json!(["corp", "legacy.reports.0"]));
+    assert_eq!(e["stages"][1]["code"], "sumunjang.stage.zone.match");
+    let none = call(
+        &a,
+        "POST",
+        "/v1/explain",
+        ADMIN,
+        Some(json!({"ip":"8.8.8.8"})),
+    )
+    .await
+    .body;
+    assert_eq!(none["stages"][1]["code"], "sumunjang.stage.zone.none");
+    let d = call(
+        &a,
+        "POST",
+        "/v1/decision",
+        COLLECTOR,
+        Some(json!({"source_id":"t","ip":"192.0.2.9","evidence":true})),
+    )
+    .await
+    .body;
+    assert_eq!(d["evidence"]["zones"], json!(["legacy.reports.0"]));
+    assert_eq!(d["evidence"]["zone_revision"], 2);
+    let b = call(
+        &a,
+        "POST",
+        "/v1/explain/batch",
+        ADMIN,
+        Some(json!({"ips":["10.9.9.9"]})),
+    )
+    .await
+    .body;
+    assert_eq!(b["results"][0]["published"]["zones"], json!(["corp"]));
+    // Zones never change the decision.
+    let plain = call(
+        &a,
+        "POST",
+        "/v1/decision",
+        COLLECTOR,
+        Some(json!({"source_id":"t","ip":"10.1.2.3"})),
+    )
+    .await
+    .body;
+    assert_eq!(plain["action"], "allow");
+    assert!(plain.get("evidence").is_none());
+}

@@ -295,6 +295,7 @@ enum Scope {
     Policy,
     Rules,
     Blocks,
+    Zones,
 }
 struct Change {
     actor: actor::Actor,
@@ -324,6 +325,7 @@ fn scope_digest(scope: Scope, e: &Engine) -> String {
         Scope::Policy => audit::policy_digest(e),
         Scope::Rules => audit::rules_digest(e),
         Scope::Blocks => audit::blocks_digest(e),
+        Scope::Zones => audit::digest(e.zones()),
     }
 }
 fn scope_summary(scope: Scope, before: &Engine, after: &Engine) -> String {
@@ -331,6 +333,7 @@ fn scope_summary(scope: Scope, before: &Engine, after: &Engine) -> String {
         Scope::Policy => audit::policy_summary(before.policy(), after.policy()),
         Scope::Rules => audit::rules_summary(before.rules(), after.rules()),
         Scope::Blocks => audit::blocks_summary(before.blocks(), after.blocks()),
+        Scope::Zones => audit::zones_summary(before.zones(), after.zones()),
     }
 }
 /// Best-effort refusal record; a failure cannot change an already refused outcome.
@@ -1146,6 +1149,14 @@ fn router(app: App) -> Router {
         .route("/v1/explain/batch", post(explain::batch))
         .route("/v1/reasons", get(explain::reasons))
         .route("/v1/rules/document", get(rules_document_get))
+        .route(
+            "/v1/zones",
+            get(console_api::zones_get)
+                .post(console_api::zones_change)
+                .delete(console_api::zones_delete),
+        )
+        .route("/v1/zones/snapshot", get(console_api::zones_snapshot))
+        .route("/v1/zones/lookup", post(console_api::zones_lookup))
         .route("/v1/history", get(console_api::history_get))
         .route("/v1/history/query", post(console_api::history_post))
         .route("/v1/asn/catalog", get(console_api::asn_get))
@@ -1221,6 +1232,7 @@ fn router(app: App) -> Router {
                                         | "/v1/explain/batch"
                                         | "/v1/history/query"
                                         | "/v1/asn/catalog/query"
+                                        | "/v1/zones/lookup"
                                 )))
                     {
                         if let Some(action) = action_for(request.method(), path)
@@ -1332,6 +1344,8 @@ fn action_for(method: &axum::http::Method, path: &str) -> Option<&'static str> {
         (&Method::POST, "/v1/update/check") => "update.check",
         (&Method::POST, "/v1/allowlist") => "allowlist.add",
         (&Method::DELETE, "/v1/allowlist") => "allowlist.remove",
+        (&Method::POST, "/v1/zones") => "zones.change",
+        (&Method::DELETE, "/v1/zones") => "zones.remove",
         _ => return None,
     })
 }
@@ -1339,6 +1353,7 @@ fn action_target(action: &str) -> &'static str {
     match action.split('.').next() {
         Some("policy") => "policy",
         Some("allowlist") => "allowlist",
+        Some("zones") => "zones",
         Some("blocks") | Some("candidates") => "blocks",
         Some("rules") => "rules",
         Some("geoip") => "geoip",

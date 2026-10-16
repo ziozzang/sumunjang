@@ -35,6 +35,7 @@ serde_path_to_error = "0.1"
 ring = "0.17"
 base64 = "0.22"
 ipnet = "2"
+prost = "0.14"
 
 guard-update = { path = "../guard-update" }
 libc = "0.2"
@@ -49,4 +50,3 @@ rustls-pemfile = "2"
 rcgen = "0.14"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
-prost = "0.14"

@@ -13,6 +13,8 @@
   "sumunjang.unavailable.source": "사용 불가: 네이티브 정책 원천이 최신 상태가 아닙니다.",
   "sumunjang.stage.mode.observe": "모드: 관찰",
   "sumunjang.stage.mode.enforce": "모드: 집행",
+  "sumunjang.stage.zone.match": "주소가 네트워크 존 {zones}에 속합니다.",
+  "sumunjang.stage.zone.none": "이 주소를 포함하는 네트워크 존이 없습니다.",
   "sumunjang.stage.allowlist.match": "허용 목록 {network}와 일치합니다.",
   "sumunjang.stage.allowlist.miss": "일치하는 허용 목록 항목이 없습니다.",
   "sumunjang.stage.geo.context": "규칙 메타데이터: 국가 {country}, ASN {asn} ({source}).",

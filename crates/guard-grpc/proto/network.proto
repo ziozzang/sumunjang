@@ -36,4 +36,11 @@ message NetworkEvidence {
  // enforce mode; meaningful while the policy is observed).
  Verdict enforce_verdict = 8;
  string enforce_reason_code = 9;
+ // Network zone ids (ADR 0021/0022) containing the address, in id order. At
+ // most 8 and trimmed further so the reply stays within the 1 KiB encode bound;
+ // zone_ids_truncated marks any omission.
+ repeated string zone_ids = 10;
+ bool zone_ids_truncated = 11;
+ // Sumunjang zone revision (Pumgye zone snapshot revision).
+ uint64 zone_revision = 12;
 }

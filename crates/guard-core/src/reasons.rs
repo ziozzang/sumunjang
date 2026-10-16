@@ -29,6 +29,8 @@ pub const DECISION_CODES: &[&str] = &[
 pub const STAGE_CODES: &[&str] = &[
     "sumunjang.stage.mode.observe",
     "sumunjang.stage.mode.enforce",
+    "sumunjang.stage.zone.match",
+    "sumunjang.stage.zone.none",
     "sumunjang.stage.allowlist.match",
     "sumunjang.stage.allowlist.miss",
     "sumunjang.stage.geo.context",

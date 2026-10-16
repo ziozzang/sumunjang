@@ -357,6 +357,15 @@ fn push_rules(
         "matched": matched, "expired": expired, "code": code, "params": params}));
 }
 
+/// Maximum zone ids in decision evidence (ADR 0019 list bound).
+pub const MAX_EVIDENCE_ZONES: usize = 8;
+fn zone_stage(view: &DecisionView, ip: IpAddr) -> Value {
+    let z = view.zones();
+    let names: Vec<&str> = z.names(view.zone_mask(ip)).collect();
+    json!({"stage": "zone", "informational": true, "zones": names, "zone_revision": z.revision,
+           "code": if names.is_empty() {"sumunjang.stage.zone.none"} else {"sumunjang.stage.zone.match"},
+           "params": {"zones": names.join(", ")}})
+}
 /// One complete traced evaluation rendered as JSON.
 fn render(
     view: &DecisionView,
@@ -387,6 +396,8 @@ fn render(
     outcome["code"] = json!(code);
     outcome["params"] = params.clone();
     stages.push(outcome);
+    // Informational zone membership (zones label addresses; they do not decide).
+    stages.insert(1, zone_stage(view, ip));
     let matched: Vec<_> = ev.rules().map(|r| r.id.clone()).collect();
     (
         json!({
@@ -568,7 +579,8 @@ fn compact(
     (
         json!({"action": d.action, "verdict": v, "reason_code": code,
                "rules": ev.rules().map(|r| r.id.clone()).collect::<Vec<_>>(),
-               "block": ev.block.map(|b| b.network.clone())}),
+               "block": ev.block.map(|b| b.network.clone()),
+               "zones": view.zones().names(view.zone_mask(ip)).collect::<Vec<_>>()}),
         d.action,
         code,
     )
@@ -675,6 +687,10 @@ pub struct DecisionEvidence {
     pub country: Option<String>,
     pub enforce_action: &'static str,
     pub enforce_reason_code: &'static str,
+    /// Zone ids containing the address (≤ 8, id order) and the zone revision.
+    pub zones: Vec<String>,
+    pub zones_truncated: bool,
+    pub zone_revision: u64,
 }
 /// Evaluate `ip` on `view` with the live geo input and collect evidence. In
 /// observe mode the matched rules and enforce outcome come from evaluating the
@@ -686,6 +702,7 @@ pub fn decision_evidence(
     time: u64,
 ) -> (DecisionEvidence, &'static str) {
     let full = catalog.context(ip);
+    let zone_mask = view.zone_mask(ip);
     let rule_geo = if view.requires_geo() {
         full
     } else {
@@ -711,6 +728,14 @@ pub fn decision_evidence(
             country: country_text(enforce.country).or_else(|| full.country.map(str::to_owned)),
             enforce_action: e.action,
             enforce_reason_code: enforce_code,
+            zones: view
+                .zones()
+                .names(zone_mask)
+                .take(MAX_EVIDENCE_ZONES)
+                .map(str::to_owned)
+                .collect(),
+            zones_truncated: zone_mask.count_ones() as usize > MAX_EVIDENCE_ZONES,
+            zone_revision: view.zones().revision,
         },
         action,
     )
@@ -730,6 +755,9 @@ impl DecisionEvidence {
             "country": self.country,
             "revision": revision,
             "enforce": {"action": self.enforce_action, "reason_code": self.enforce_reason_code},
+            "zones": self.zones,
+            "zones_truncated": self.zones_truncated,
+            "zone_revision": self.zone_revision,
         })
     }
 }

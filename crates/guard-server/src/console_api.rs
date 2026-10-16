@@ -331,3 +331,155 @@ pub async fn prune_expired_allow(app: App) {
         eprintln!("expired allowlist pruning failed: {}", body.0);
     }
 }
+
+// ----- network zones (ADR 0021/0022) -----
+
+fn zones_document(e: &Engine) -> Value {
+    let z = e.zones();
+    json!({"schema": "sumunjang.zones.v1", "revision": z.revision,
+           "limits": {"zones": guard_core::zones::MAX_ZONES, "prefixes": guard_core::zones::MAX_PREFIXES},
+           "zones": z.zones.values().collect::<Vec<_>>()})
+}
+pub async fn zones_get(HttpState(app): HttpState<App>) -> ApiResult {
+    operation(app, |e| Ok(zones_document(e))).await
+}
+/// Pumgye contract snapshot: exactly `{revision, zones: {name: {prefixes}}}`.
+/// The revision and a SHA-256 digest of the body are also sent as headers.
+pub async fn zones_snapshot(HttpState(app): HttpState<App>) -> MutationResult {
+    use axum::response::IntoResponse;
+    let Json(snapshot) = operation(app, |e| Ok(e.zones().snapshot())).await?;
+    let bytes = serde_json::to_vec(&snapshot)
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "serialization failed"))?;
+    let mut response = Json(snapshot.clone()).into_response();
+    let headers = response.headers_mut();
+    if let Ok(v) = snapshot["revision"].to_string().parse() {
+        headers.insert("x-sumunjang-zone-revision", v);
+    }
+    if let Ok(v) = format!("sha256:{}", actor::sha256_hex(&bytes)).parse() {
+        headers.insert("x-sumunjang-zone-digest", v);
+    }
+    Ok(response)
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ZoneChange {
+    expected_revision: u64,
+    /// Create or replace this zone.
+    #[serde(default)]
+    zone: Option<guard_core::zones::Zone>,
+    /// Remove the zone with this id (broker clients without DELETE routes).
+    #[serde(default)]
+    remove: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ZoneRemove {
+    expected_revision: u64,
+    id: String,
+    #[serde(default)]
+    reason: Option<String>,
+}
+const ZONE_CONFLICT: &str = "zone revision conflict;";
+fn zone_revision(e: &Engine) -> String {
+    e.zones().revision.to_string()
+}
+fn zone_errors(errors: Vec<guard_core::FieldError>) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error": "invalid zone", "errors": errors})),
+    )
+}
+async fn zone_write(
+    app: App,
+    actor: actor::Actor,
+    expected: u64,
+    zone: Option<guard_core::zones::Zone>,
+    remove: Option<String>,
+    reason: Option<String>,
+) -> MutationResult {
+    check_reason(&reason)?;
+    let (action, target) = match (&zone, &remove) {
+        (Some(z), None) => {
+            let errors: Vec<_> = z
+                .diagnose()
+                .into_iter()
+                .map(|e| guard_core::FieldError::new(format!("/zone{}", e.path), e.message))
+                .collect();
+            if !errors.is_empty() {
+                return Err(zone_errors(errors));
+            }
+            ("zones.upsert", z.id.clone())
+        }
+        (None, Some(id)) => ("zones.remove", id.clone()),
+        _ => {
+            return Err(zone_errors(vec![guard_core::FieldError::new(
+                "",
+                "provide exactly one of zone or remove",
+            )]));
+        }
+    };
+    let by: String = actor.name.chars().take(64).collect();
+    let mut change = Change::new(actor, action, Scope::Zones, target);
+    change.reason = reason;
+    let on_conflict = conflict(&app, ZONE_CONFLICT, zone_revision);
+    mutation(app, change, move |e| {
+        anyhow::ensure!(
+            e.zones().revision == expected,
+            "zone revision conflict; reload zones and retry."
+        );
+        match (zone, remove) {
+            (Some(zone), _) => e.set_zone(zone, now(), Some(&by))?,
+            (_, Some(id)) => anyhow::ensure!(e.remove_zone(&id)?, "zone not found"),
+            _ => unreachable!(),
+        }
+        Ok(zones_document(e))
+    })
+    .await
+    .map_err(on_conflict)
+}
+/// `POST /v1/zones`: `{expected_revision, zone | remove, reason?}`.
+pub async fn zones_change(
+    HttpState(app): HttpState<App>,
+    axum::Extension(actor): axum::Extension<actor::Actor>,
+    Json(input): Json<ZoneChange>,
+) -> MutationResult {
+    zone_write(
+        app,
+        actor,
+        input.expected_revision,
+        input.zone,
+        input.remove,
+        input.reason,
+    )
+    .await
+}
+/// `DELETE /v1/zones`: `{expected_revision, id, reason?}`.
+pub async fn zones_delete(
+    HttpState(app): HttpState<App>,
+    axum::Extension(actor): axum::Extension<actor::Actor>,
+    Json(input): Json<ZoneRemove>,
+) -> MutationResult {
+    zone_write(
+        app,
+        actor,
+        input.expected_revision,
+        None,
+        Some(input.id),
+        input.reason,
+    )
+    .await
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ZoneLookup {
+    ip: std::net::IpAddr,
+}
+/// `POST /v1/zones/lookup {ip}` → zone ids containing the address.
+pub async fn zones_lookup(HttpState(app): HttpState<App>, Json(q): Json<ZoneLookup>) -> ApiResult {
+    let view = app.view.load_full();
+    let z = view.zones();
+    Ok(Json(json!({"ip": q.ip.to_string(), "revision": z.revision,
+                   "zones": z.names(view.zone_mask(q.ip)).collect::<Vec<_>>()})))
+}

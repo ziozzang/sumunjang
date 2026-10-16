@@ -149,8 +149,22 @@ impl Service {
                     1
                 },
                 enforce_reason_code: evidence.enforce_reason_code.into(),
+                zone_ids: evidence.zones,
+                zone_ids_truncated: evidence.zones_truncated,
+                zone_revision: evidence.zone_revision,
             }
         });
+        // Keep the reply within the 1 KiB encode bound: drop trailing zone ids.
+        use prost::Message;
+        while reply.encoded_len() > 1024 {
+            match reply.evidence.as_mut() {
+                Some(e) if !e.zone_ids.is_empty() => {
+                    e.zone_ids.pop();
+                    e.zone_ids_truncated = true;
+                }
+                _ => break,
+            }
+        }
         reply
     }
     fn reply(
@@ -323,6 +337,42 @@ mod tests {
         let evidence = fenced.evidence.unwrap();
         assert_eq!(evidence.reason_code, "sumunjang.unavailable.revision_floor");
         assert!(evidence.rule_ids.is_empty() && evidence.block_network.is_empty());
+    }
+    #[test]
+    fn evidence_zone_ids_stay_within_the_encode_bound() {
+        let service = Service {
+            app: crate::tests::app(),
+            requests: Arc::new(Semaphore::new(1)),
+        };
+        {
+            let mut inner = service.app.inner.lock().unwrap();
+            for i in 0..20 {
+                inner
+                    .engine
+                    .set_zone(
+                        guard_core::zones::Zone {
+                            id: format!("{:0>128}", i),
+                            prefixes: vec!["192.0.2.0/24".into()],
+                            ..Default::default()
+                        },
+                        1,
+                        None,
+                    )
+                    .unwrap();
+            }
+            service
+                .app
+                .view
+                .store(Arc::new(inner.engine.decision_view()));
+        }
+        let view = service.app.view.load_full();
+        let reply = service.reply_with_evidence(7, 0, &view, "192.0.2.1".parse().unwrap());
+        use prost::Message;
+        assert!(reply.encoded_len() <= 1024);
+        let evidence = reply.evidence.unwrap();
+        assert!(evidence.zone_ids_truncated);
+        assert!(!evidence.zone_ids.is_empty() && evidence.zone_ids.len() < 8);
+        assert_eq!(evidence.zone_revision, 20);
     }
     #[test]
     fn changed_owner_with_same_revision_discards_captured_network_reply() {

@@ -13,6 +13,8 @@
   "sumunjang.unavailable.source": "Unavailable: the native policy source is not fresh.",
   "sumunjang.stage.mode.observe": "Mode is observe.",
   "sumunjang.stage.mode.enforce": "Mode is enforce.",
+  "sumunjang.stage.zone.match": "Address is in network zones: {zones}.",
+  "sumunjang.stage.zone.none": "No network zone contains this address.",
   "sumunjang.stage.allowlist.match": "Allowlist matched {network}.",
   "sumunjang.stage.allowlist.miss": "No allowlist entry matched.",
   "sumunjang.stage.geo.context": "Rule metadata: country {country}, ASN {asn} ({source}).",
