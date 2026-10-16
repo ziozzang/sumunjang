@@ -133,6 +133,9 @@ struct Args {
     /// Per-address signal history retention in hours (memory only).
     #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(u64).range(1..=48))]
     history_hours: u64,
+    /// Days an expired allowlist entry stays visible before automatic, audited removal.
+    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3650))]
+    allow_expired_retention_days: u64,
 }
 struct Inner {
     engine: Engine,
@@ -156,6 +159,8 @@ struct App {
     network_source_phase: Arc<std::sync::atomic::AtomicU8>,
     audit: audit::Retention,
     nonces: actor::Nonces,
+    /// Seconds an expired allow entry is kept (visible as expired) before pruning.
+    allow_expired_keep: u64,
 }
 impl App {
     fn source_remaining(&self, view: &guard_core::DecisionView) -> Option<u64> {
@@ -1826,6 +1831,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let app = App {
         audit: audit_retention,
         nonces: actor::Nonces::default(),
+        allow_expired_keep: args.allow_expired_retention_days * 86_400,
         native_source,
         network_source: Arc::new(arc_swap::ArcSwapOption::empty()),
         network_source_phase: Arc::new(std::sync::atomic::AtomicU8::new(0)),
@@ -1944,7 +1950,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let worker = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
         loop {
-            tokio::select! {_ = interval.tick()=>{let a=checkpoint_app.clone();if let Err(e)=checkpoint(a).await {eprintln!("checkpoint failed: {e}");}}, _=stop_rx.changed()=>break}
+            tokio::select! {_ = interval.tick()=>{let a=checkpoint_app.clone();if let Err(e)=checkpoint(a).await {eprintln!("checkpoint failed: {e}");} console_api::prune_expired_allow(checkpoint_app.clone()).await;}, _=stop_rx.changed()=>break}
         }
     });
     let listener = if args.serve_child {
@@ -2059,6 +2065,7 @@ mod tests {
         App {
             audit: audit::Retention::default(),
             nonces: actor::Nonces::default(),
+            allow_expired_keep: 30 * 86_400,
             native_source: None,
             network_source: Arc::new(arc_swap::ArcSwapOption::empty()),
             network_source_phase: Arc::new(std::sync::atomic::AtomicU8::new(0)),

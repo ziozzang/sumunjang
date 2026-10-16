@@ -102,6 +102,18 @@ fn text_ok(v: &Option<String>, max: usize) -> bool {
     v.as_ref()
         .is_none_or(|v| v.len() <= max && !v.chars().any(char::is_control))
 }
+/// True when two policies differ at most in `allow` / `allow_meta`.
+fn allow_only_change(a: &Policy, b: &Policy) -> bool {
+    a.mode == b.mode
+        && a.auto_block == b.auto_block
+        && a.window_secs == b.window_secs
+        && a.threshold == b.threshold
+        && a.block_ttl_secs == b.block_ttl_secs
+        && a.weights.honeypot == b.weights.honeypot
+        && a.weights.scanner == b.weights.scanner
+        && a.weights.auth_failure == b.weights.auth_failure
+        && a.weights.invalid_request == b.weights.invalid_request
+}
 /// Allowlist trie with entry expiry (`u64::MAX`: no expiry).
 fn allow_trie(policy: &Policy) -> Result<PrefixTrie<u64>> {
     let mut trie = PrefixTrie::default();
@@ -361,6 +373,12 @@ pub struct State {
     /// Lua source that produced `rules`, when rules were applied from Lua.
     #[serde(default)]
     pub rules_script: Option<String>,
+    /// Rules revision lineage and sequence, persisted so rules compare-and-set
+    /// survives restarts (absent in older checkpoints: a new lineage starts).
+    #[serde(default)]
+    pub rules_epoch: Option<String>,
+    #[serde(default)]
+    pub rules_sequence: Option<u64>,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Stats {
@@ -394,6 +412,7 @@ pub struct Engine {
     snapshot_bytes: usize,
     rules: RuleSet,
     compiled_rules: Arc<CompiledRules>,
+    rules_epoch: String,
     rules_sequence: u64,
     rules_script: Option<String>,
     asn_catalog: Arc<Vec<AsnPrefix>>,
@@ -413,6 +432,7 @@ impl Engine {
             .map_err(|e| anyhow::anyhow!("policy epoch unavailable: {e}"))?;
         Ok(Self {
             policy_epoch: epoch.iter().map(|b| format!("{b:02x}")).collect(),
+            rules_epoch: epoch.iter().map(|b| format!("{b:02x}")).collect(),
             policy_sequence: 1,
             policy,
             revision: 1,
@@ -437,7 +457,7 @@ impl Engine {
     /// Opaque rules revision (`epoch:r<sequence>`), changed by every rules write
     /// and across restarts, for rules compare-and-set.
     pub fn rules_revision(&self) -> String {
-        format!("{}:r{}", self.policy_epoch, self.rules_sequence)
+        format!("{}:r{}", self.rules_epoch, self.rules_sequence)
     }
     /// Lua source of the active rules, when they were applied from Lua.
     pub fn rules_script(&self) -> Option<&str> {
@@ -460,6 +480,18 @@ impl Engine {
     }
     pub fn set_history(&mut self, h: Arc<std::sync::Mutex<history::SignalHistory>>) {
         self.history = h;
+    }
+    /// Allow entries whose expiry passed at least `keep_secs` ago.
+    pub fn stale_allow_entries(&self, now: u64, keep_secs: u64) -> Vec<String> {
+        self.policy
+            .allow_meta
+            .iter()
+            .filter(|(_, m)| {
+                m.expires_at
+                    .is_some_and(|e| e.saturating_add(keep_secs) <= now)
+            })
+            .map(|(k, _)| k.clone())
+            .collect()
     }
     /// Keep existing allow metadata for entries still present when a policy
     /// write (legacy clients) omits `allow_meta`, so expiries are never lost.
@@ -518,9 +550,13 @@ impl Engine {
         self.snapshot_bytes = snapshot_budget(&policy, self.blocks.values().map(AsRef::as_ref));
         self.policy_sequence = sequence;
         self.allow_index = allow_index;
+        // The evidence window restarts when scoring inputs change; allowlist-only
+        // changes (operators adding entries during an incident) keep evidence.
+        if !allow_only_change(&self.policy, &policy) {
+            self.aggregates.clear();
+            self.last_pruned = None;
+        }
         self.policy = policy;
-        self.aggregates.clear();
-        self.last_pruned = None;
         self.revision = self.revision.saturating_add(1);
         Ok(())
     }
@@ -834,6 +870,8 @@ impl Engine {
                 .map(|(k, b)| (k.clone(), b.origin.clone()))
                 .collect(),
             rules_script: self.rules_script.clone(),
+            rules_epoch: Some(self.rules_epoch.clone()),
+            rules_sequence: Some(self.rules_sequence),
         }
     }
     pub fn restore(state: State) -> Result<Self> {
@@ -854,6 +892,14 @@ impl Engine {
             "stored Lua source exceeds 32 KiB"
         );
         engine.rules_script = state.rules_script;
+        if let (Some(epoch), Some(sequence)) = (state.rules_epoch, state.rules_sequence) {
+            ensure!(
+                epoch.len() == 64 && epoch.bytes().all(|b| b.is_ascii_hexdigit()) && sequence > 0,
+                "invalid stored rules revision"
+            );
+            engine.rules_epoch = epoch;
+            engine.rules_sequence = sequence;
+        }
         engine.revision = revision;
         let mut origins = state.block_origins;
         for mut b in state.blocks {
@@ -1928,6 +1974,8 @@ mod console_gap_tests {
         e.carry_allow_meta(&mut legacy);
         e.set_policy(legacy).unwrap();
         assert_eq!(e.policy().allow_meta["192.0.2.0/24"].expires_at, Some(200));
+        assert_eq!(e.stale_allow_entries(200 + 99, 100), Vec::<String>::new());
+        assert_eq!(e.stale_allow_entries(300, 100), ["192.0.2.0/24"]);
         let mut orphan = e.policy().clone();
         orphan
             .allow_meta
@@ -1993,7 +2041,8 @@ mod console_gap_tests {
         assert!(e.rules_script().is_some());
         let restored = Engine::restore(e.state()).unwrap();
         assert_eq!(restored.rules_script(), e.rules_script());
-        assert_ne!(restored.rules_revision(), e.rules_revision());
+        // The rules revision survives restart, so CAS does not spuriously conflict.
+        assert_eq!(restored.rules_revision(), e.rules_revision());
         e.set_rules(RuleSet::default()).unwrap();
         assert!(e.rules_script().is_none());
         for kind in [EventKind::Honeypot, EventKind::Scanner, EventKind::Scanner] {
@@ -2020,5 +2069,31 @@ mod console_gap_tests {
         .unwrap();
         assert_eq!(e.asn_catalog()[0].asn, 1);
         assert_eq!(e.asn_catalog()[1].network, "198.51.100.0/24");
+    }
+    #[test]
+    fn allowlist_only_policy_changes_keep_the_evidence_window() {
+        let mut e = Engine::new(Policy::default()).unwrap();
+        e.ingest(batch("192.0.2.5", EventKind::Honeypot, 100), 100)
+            .unwrap();
+        let mut p = e.policy().clone();
+        p.allow.push("198.51.100.0/24".into());
+        p.allow_meta.insert(
+            "198.51.100.0/24".into(),
+            AllowMeta {
+                reason: Some("incident".into()),
+                ..Default::default()
+            },
+        );
+        e.set_policy(p).unwrap();
+        assert_eq!(e.candidates(100)[0].score, 10);
+        let mut p = e.policy().clone();
+        p.allow.clear();
+        p.allow_meta.clear();
+        e.set_policy(p).unwrap();
+        assert_eq!(e.candidates(100).len(), 1);
+        let mut p = e.policy().clone();
+        p.threshold = 20;
+        e.set_policy(p).unwrap();
+        assert!(e.candidates(100).is_empty());
     }
 }

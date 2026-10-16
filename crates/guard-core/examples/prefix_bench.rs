@@ -93,6 +93,8 @@ fn main() {
             let engine = Engine::restore(State {
                 block_origins: Default::default(),
                 rules_script: None,
+                rules_epoch: None,
+                rules_sequence: None,
                 policy: Policy {
                     mode: Mode::Enforce,
                     ..Policy::default()

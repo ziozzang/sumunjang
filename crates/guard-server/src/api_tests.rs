@@ -1621,3 +1621,79 @@ async fn allowlist_entries_expire_and_use_compare_and_set() {
     );
     assert!(all.iter().any(|e| e["result"] == "refused"));
 }
+
+#[tokio::test]
+async fn allowlist_writes_keep_evidence_and_expired_entries_are_pruned_with_audit() {
+    let mut a = app();
+    events(&a, "198.51.100.7", &["honeypot"]).await;
+    let rev = call(&a, "GET", "/v1/allowlist", ADMIN, None).await.body["revision"].clone();
+    let r = call(&a, "POST", "/v1/allowlist", ADMIN, Some(json!({"expected_revision":rev,"network":"203.0.113.0/24","expires_at":crate::now()+60,"reason":"incident"}))).await;
+    assert_eq!(r.status, StatusCode::OK);
+    let c = call(&a, "GET", "/v1/candidates", ADMIN, None).await.body;
+    assert_eq!(
+        c[0]["score"], 10,
+        "allowlist write must keep the evidence window"
+    );
+    // A policy-document write whose only change is the allowlist also keeps it.
+    let d = document(&a).await;
+    let mut p = d["policy"].clone();
+    p["allow"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("192.0.2.0/24"));
+    assert_eq!(put_document(&a, p).await.status, StatusCode::OK);
+    assert_eq!(
+        call(&a, "GET", "/v1/candidates", ADMIN, None).await.body[0]["score"],
+        10
+    );
+    // Expired beyond retention: removed by the maintenance job, audited.
+    {
+        let mut inner = a.inner.lock().unwrap();
+        let mut policy = inner.engine.policy().clone();
+        policy
+            .allow_meta
+            .get_mut("203.0.113.0/24")
+            .unwrap()
+            .expires_at = Some(crate::now() - 100);
+        inner.engine.set_policy(policy).unwrap();
+    }
+    a.allow_expired_keep = 1000;
+    crate::console_api::prune_expired_allow(a.clone()).await;
+    let list = call(&a, "GET", "/v1/allowlist", ADMIN, None).await.body;
+    let expired = list["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["network"] == "203.0.113.0/24")
+        .unwrap()
+        .clone();
+    assert_eq!(expired["expired"], true, "kept visible within retention");
+    a.allow_expired_keep = 50;
+    crate::console_api::prune_expired_allow(a.clone()).await;
+    let list = call(&a, "GET", "/v1/allowlist", ADMIN, None).await.body;
+    assert_eq!(list["entries"].as_array().unwrap().len(), 1);
+    let e = &entries(&a, "?action=allowlist.expire").await[0];
+    assert_eq!(
+        (
+            e["actor"]["kind"].clone(),
+            e["result"].clone(),
+            e["target"].clone()
+        ),
+        (json!("system"), json!("committed"), json!("203.0.113.0/24"))
+    );
+    assert_eq!(
+        call(&a, "GET", "/v1/candidates", ADMIN, None).await.body[0]["score"],
+        10
+    );
+    let h = call(
+        &a,
+        "POST",
+        "/v1/history/query",
+        ADMIN,
+        Some(json!({"ip":"198.51.100.7"})),
+    )
+    .await
+    .body;
+    assert_eq!(h["in_memory"], true);
+    assert!(h["retained_since"].as_u64().unwrap() <= crate::now());
+}

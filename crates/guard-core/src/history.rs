@@ -69,6 +69,7 @@ pub struct SignalHistory {
     buckets: usize,
     dropped: u64,
     last_pruned: u64,
+    started_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -80,17 +81,28 @@ pub struct HistoryStats {
     pub max_addresses: usize,
     pub max_buckets: usize,
     pub dropped: u64,
+    /// History is memory-only: collection started at this Unix time (process
+    /// start); nothing older than this exists.
+    pub started_at: u64,
 }
 
 impl SignalHistory {
     pub fn new(retention_secs: u64) -> Self {
         Self {
             retention: retention_secs.clamp(BUCKET_SECS, MAX_RETENTION_SECS),
+            started_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
             ..Self::default()
         }
     }
     pub fn retention_secs(&self) -> u64 {
         self.retention
+    }
+    /// Earliest time history can cover at `now`: process start or retention edge.
+    pub fn retained_since(&self, now: u64) -> u64 {
+        self.started_at.max(now.saturating_sub(self.retention))
     }
     fn prune(&mut self, now: u64) {
         if now.saturating_sub(self.last_pruned) < BUCKET_SECS && self.last_pruned != 0 {
@@ -153,6 +165,7 @@ impl SignalHistory {
             max_addresses: MAX_ADDRESSES,
             max_buckets: MAX_BUCKETS,
             dropped: self.dropped,
+            started_at: self.started_at,
         }
     }
 }

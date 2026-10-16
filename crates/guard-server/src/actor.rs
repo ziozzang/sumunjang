@@ -61,6 +61,17 @@ impl Actor {
             request_sha256: None,
         }
     }
+    /// Sumunjang's own maintenance (expired allowlist pruning).
+    pub fn system() -> Self {
+        Self {
+            kind: "system",
+            id: None,
+            name: "sumunjang".into(),
+            issuer: "sumunjang".into(),
+            client_ip: None,
+            request_sha256: None,
+        }
+    }
     pub fn kubernetes(source: &str) -> Self {
         Self {
             kind: "kubernetes",

@@ -72,9 +72,12 @@ async fn history(app: App, q: HistoryQuery) -> ApiResult {
             totals.merge(&b.signals);
             score = score.saturating_add(b.score);
         }
+        let retained_since = h.retained_since(time);
         Ok(json!({
             "schema": "sumunjang.history.v1",
             "ip": ip.to_string(),
+            "in_memory": true,
+            "retained_since": retained_since,
             "since": since,
             "until": until,
             "bucket_secs": history::BUCKET_SECS,
@@ -282,4 +285,49 @@ pub async fn allowlist_remove(
     })
     .await
     .map_err(on_conflict)
+}
+
+/// Remove allow entries expired for longer than the configured retention, as
+/// one audited `allowlist.expire` change by the `system` actor. Allowlist-only
+/// changes keep the evidence window. Native Kubernetes ownership skips it.
+pub async fn prune_expired_allow(app: App) {
+    if app.native_source.is_some() {
+        return;
+    }
+    let time = now();
+    let stale = match app.inner.lock() {
+        Ok(inner) => inner
+            .engine
+            .stale_allow_entries(time, app.allow_expired_keep),
+        Err(_) => return,
+    };
+    if stale.is_empty() {
+        return;
+    }
+    let mut change = Change::new(
+        actor::Actor::system(),
+        "allowlist.expire",
+        Scope::Policy,
+        stale.join(",").chars().take(256).collect::<String>(),
+    );
+    change.reason = Some(format!(
+        "expired more than {} days ago",
+        app.allow_expired_keep / 86_400
+    ));
+    let keep = app.allow_expired_keep;
+    if let Err((_, body)) = mutation(app, change, move |e| {
+        let stale = e.stale_allow_entries(time, keep);
+        anyhow::ensure!(!stale.is_empty(), "no expired allow entries");
+        let mut policy = e.policy().clone();
+        policy.allow.retain(|n| !stale.contains(n));
+        for n in &stale {
+            policy.allow_meta.remove(n);
+        }
+        e.set_policy(policy)?;
+        Ok(json!({"removed": stale}))
+    })
+    .await
+    {
+        eprintln!("expired allowlist pruning failed: {}", body.0);
+    }
 }
