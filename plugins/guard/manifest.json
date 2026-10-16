@@ -1,8 +1,8 @@
 {
   "id": "guard",
   "name": "Sumunjang (\uc218\ubb38\uc7a5)",
-  "version": "0.1.7",
-  "api_version": 1,
+  "version": "0.2.0",
+  "api_version": 2,
   "entry": "index.js",
   "assets": {
     "index.js": "f80b3b4b5341773ba4bcd0ec556f4cbfacc092a69e092f9d5a719599a492b5e5",
@@ -169,6 +169,60 @@
       "path": "zones",
       "method": "POST",
       "mutation": true
+    },
+    {
+      "path": "audit",
+      "method": "GET",
+      "mutation": false
+    },
+    {
+      "path": "asn/bundle",
+      "method": "GET",
+      "mutation": false
+    },
+    {
+      "path": "asn/bundle",
+      "method": "PUT",
+      "mutation": true
+    },
+    {
+      "path": "asn/bundle/rollback",
+      "method": "POST",
+      "mutation": true
+    },
+    {
+      "path": "asn/refresh",
+      "method": "POST",
+      "mutation": true
+    },
+    {
+      "path": "asn/preview",
+      "method": "POST",
+      "mutation": false
+    },
+    {
+      "path": "asn/proposals",
+      "method": "GET",
+      "mutation": false
+    },
+    {
+      "path": "asn/proposals",
+      "method": "POST",
+      "mutation": true
+    }
+  ],
+  "route_patterns": [
+    {
+      "path": "asn/proposals/*",
+      "method": "GET",
+      "mutation": false,
+      "max_depth": 1
+    },
+    {
+      "path": "asn/proposals/*",
+      "method": "POST",
+      "mutation": true,
+      "max_depth": 1
     }
   ]
 }
