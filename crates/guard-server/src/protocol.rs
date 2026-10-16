@@ -19,8 +19,8 @@ pub(crate) fn tls_acceptor(
     cert: &std::path::Path,
     key: &std::path::Path,
     ca: &std::path::Path,
-) -> anyhow::Result<tokio_rustls::TlsAcceptor> {
-    Ok(tokio_rustls::TlsAcceptor::from(
+) -> anyhow::Result<crate::tls_reload::AcceptorSource> {
+    Ok(crate::tls_reload::AcceptorSource::fixed(
         hangang_runtime::tls_config(cert, key, ca, &[b"hgd1"])?,
     ))
 }
@@ -151,7 +151,7 @@ pub(crate) async fn serve_with_tls(
     listener: TcpListener,
     app: App,
     mut stop: watch::Receiver<bool>,
-    tls: Option<tokio_rustls::TlsAcceptor>,
+    tls: Option<crate::tls_reload::AcceptorSource>,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
         tls.is_some() || listener.local_addr()?.ip().is_loopback(),
@@ -163,7 +163,10 @@ pub(crate) async fn serve_with_tls(
         Duration::ZERO,
         move |stream, peer| {
             let app = app.clone();
-            let tls = tls.clone();
+            // Current material per handshake (hot reload); open sessions keep theirs.
+            let tls = tls
+                .as_ref()
+                .map(crate::tls_reload::AcceptorSource::acceptor);
             async move {
                 if tls.is_none() && !peer.ip().is_loopback() {
                     return;

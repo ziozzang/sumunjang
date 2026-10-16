@@ -1928,3 +1928,42 @@ async fn zone_snapshot_matches_the_pumgye_contract_and_membership_is_reported() 
     assert_eq!(plain["action"], "allow");
     assert!(plain.get("evidence").is_none());
 }
+
+#[tokio::test]
+async fn readiness_reflects_checkpoint_health_and_status_reports_tls() {
+    let a = app();
+    let probe = |a: &App| {
+        let a = a.clone();
+        async move {
+            crate::router(a)
+                .oneshot(
+                    Request::builder()
+                        .uri("/readyz")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    assert_eq!(probe(&a).await, StatusCode::OK);
+    a.db.lock()
+        .unwrap()
+        .execute_batch("DROP TABLE checkpoint")
+        .unwrap();
+    assert!(crate::checkpoint(a.clone()).await.is_err());
+    assert_eq!(probe(&a).await, StatusCode::SERVICE_UNAVAILABLE);
+    let s = call(&a, "GET", "/v1/status", ADMIN, None).await.body;
+    assert_eq!(
+        (s["ready"].clone(), s["not_ready_reason"].clone()),
+        (json!(false), json!("checkpoint failing"))
+    );
+    assert_eq!(s["tls"]["enabled"], false);
+    a.db.lock()
+        .unwrap()
+        .execute_batch("CREATE TABLE checkpoint(id INTEGER PRIMARY KEY,body TEXT NOT NULL)")
+        .unwrap();
+    crate::checkpoint(a.clone()).await.unwrap();
+    assert_eq!(probe(&a).await, StatusCode::OK);
+}

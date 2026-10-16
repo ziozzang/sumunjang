@@ -13,6 +13,7 @@ mod protocol;
 mod readiness;
 #[cfg(target_os = "linux")]
 mod supervisor;
+mod tls_reload;
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, State as HttpState},
@@ -136,6 +137,9 @@ struct Args {
     /// Days an expired allowlist entry stays visible before automatic, audited removal.
     #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3650))]
     allow_expired_retention_days: u64,
+    /// Seconds between TLS certificate/key/CA file checks (0 disables reload).
+    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(0..=3600))]
+    tls_reload_seconds: u64,
 }
 struct Inner {
     engine: Engine,
@@ -161,8 +165,27 @@ struct App {
     nonces: actor::Nonces,
     /// Seconds an expired allow entry is kept (visible as expired) before pruning.
     allow_expired_keep: u64,
+    /// Reloadable mTLS material (None without decision TLS flags).
+    tls: Option<Arc<tls_reload::TlsReloader>>,
+    /// Set while the most recent periodic checkpoint failed (readiness).
+    checkpoint_failed: Arc<std::sync::atomic::AtomicBool>,
 }
 impl App {
+    /// Readiness: a fresh native source (when configured) and a healthy
+    /// durable checkpoint. TLS reload failures keep the previous valid
+    /// material serving and do not affect readiness (see `GET /v1/status`).
+    fn ready_reason(&self) -> Option<&'static str> {
+        if self.source_remaining(&self.view.load()).is_none() {
+            Some("native source unavailable")
+        } else if self
+            .checkpoint_failed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            Some("checkpoint failing")
+        } else {
+            None
+        }
+    }
     fn source_remaining(&self, view: &guard_core::DecisionView) -> Option<u64> {
         self.native_source
             .as_ref()
@@ -628,7 +651,12 @@ async fn decision(
 async fn status(HttpState(app): HttpState<App>) -> ApiResult {
     let max_requests = app.max_http_requests;
     let geoip = app.geo.load().status();
-    operation(app,move|e|{let(candidates,blocks)=e.capacity();Ok(json!({"health":"ok","stats":e.stats(),"geoip":geoip,"rules":{"count":e.rules().rules.len(),"snapshot_supported":e.rules().rules.is_empty()},"capacity":{"candidates":candidates,"blocks":blocks,"max_candidates":guard_core::MAX_CANDIDATES,"max_blocks":guard_core::MAX_BLOCKS,"max_batch":256,"max_body_bytes":4*1024*1024,"max_workers":1024,"max_requests":max_requests}}))}).await
+    let tls = app
+        .tls
+        .as_ref()
+        .map_or(json!({"enabled":false}), |t| t.status());
+    let ready = app.ready_reason();
+    operation(app,move|e|{let(candidates,blocks)=e.capacity();Ok(json!({"health":"ok","tls":tls,"ready":ready.is_none(),"not_ready_reason":ready,"stats":e.stats(),"geoip":geoip,"rules":{"count":e.rules().rules.len(),"snapshot_supported":e.rules().rules.is_empty()},"capacity":{"candidates":candidates,"blocks":blocks,"max_candidates":guard_core::MAX_CANDIDATES,"max_blocks":guard_core::MAX_BLOCKS,"max_batch":256,"max_body_bytes":4*1024*1024,"max_workers":1024,"max_requests":max_requests}}))}).await
 }
 
 async fn candidates(HttpState(app): HttpState<App>) -> ApiResult {
@@ -1089,10 +1117,9 @@ async fn native_source_status(HttpState(app): HttpState<App>) -> Json<Value> {
     )
 }
 async fn ready(HttpState(app): HttpState<App>) -> Response {
-    if app.source_remaining(&app.view.load()).is_some() {
-        Json(json!({"status":"ready"})).into_response()
-    } else {
-        error(StatusCode::SERVICE_UNAVAILABLE, "native source unavailable").into_response()
+    match app.ready_reason() {
+        None => Json(json!({"status":"ready"})).into_response(),
+        Some(reason) => error(StatusCode::SERVICE_UNAVAILABLE, reason).into_response(),
     }
 }
 fn router(app: App) -> Router {
@@ -1695,27 +1722,30 @@ async fn run(args: Args) -> anyhow::Result<()> {
             "remote binary decision listener requires mTLS"
         );
     }
-    let management_tls = if args.management_tls {
-        Some(hangang_runtime::tls_config(
-            args.decision_tls_cert.as_ref().unwrap(),
-            args.decision_tls_key.as_ref().unwrap(),
-            args.decision_client_ca.as_ref().unwrap(),
-            &[b"http/1.1"],
-        )?)
-    } else {
-        None
-    };
-    let decision_tls = args
+    // One reloadable source of TLS material for every mTLS listener.
+    let tls_reloader = args
         .decision_tls_cert
         .as_ref()
         .map(|cert| {
-            protocol::tls_acceptor(
-                cert,
-                args.decision_tls_key.as_ref().unwrap(),
-                args.decision_client_ca.as_ref().unwrap(),
-            )
+            tls_reload::TlsReloader::new(tls_reload::TlsFiles {
+                cert: cert.clone(),
+                key: args.decision_tls_key.clone().unwrap(),
+                ca: args.decision_client_ca.clone().unwrap(),
+            })
         })
         .transpose()?;
+    if let Some(r) = &tls_reloader {
+        eprintln!(
+            "tls: loaded certificate material; leaf sha256 {}",
+            r.fingerprint()
+        );
+    }
+    let management_tls = if args.management_tls {
+        tls_reloader.as_ref().map(|r| r.management())
+    } else {
+        None
+    };
+    let decision_tls = tls_reloader.as_ref().map(|r| r.hgd1());
     if args.check {
         check_configuration(&args)?;
         println!("configuration valid");
@@ -1847,6 +1877,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
         audit: audit_retention,
         nonces: actor::Nonces::default(),
         allow_expired_keep: args.allow_expired_retention_days * 86_400,
+        tls: tls_reloader.clone(),
+        checkpoint_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         native_source,
         network_source: Arc::new(arc_swap::ArcSwapOption::empty()),
         network_source_phase: Arc::new(std::sync::atomic::AtomicU8::new(0)),
@@ -1935,11 +1967,10 @@ async fn run(args: Args) -> anyhow::Result<()> {
         None
     };
     let grpc_worker = if let Some(address) = args.grpc_listen {
-        let tls = grpc::configuration(
-            args.decision_tls_cert.as_ref().unwrap(),
-            args.decision_tls_key.as_ref().unwrap(),
-            args.decision_client_ca.as_ref().unwrap(),
-        )?;
+        let tls = tls_reloader
+            .as_ref()
+            .map(|r| r.grpc())
+            .ok_or_else(|| anyhow::anyhow!("gRPC requires decision TLS material"))?;
         let listener = if args.serve_child {
             #[cfg(target_os = "linux")]
             {
@@ -1961,6 +1992,15 @@ async fn run(args: Args) -> anyhow::Result<()> {
     } else {
         None
     };
+    if let Some(reloader) = tls_reloader.clone()
+        && args.tls_reload_seconds > 0
+    {
+        tokio::spawn(tls_reload::follow(
+            reloader,
+            std::time::Duration::from_secs(args.tls_reload_seconds),
+            stop_rx.clone(),
+        ));
+    }
     let checkpoint_app = app.clone();
     let worker = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -2002,7 +2042,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         let _ = shutdown_stop.send(true);
     };
     let serving = if let Some(config) = management_tls {
-        hangang_runtime::serve_https(listener, config, router(app.clone()), stopping).await
+        tls_reload::serve_https(listener, config, router(app.clone()), stopping).await
     } else {
         let listener = listener.tap_io(|stream| {
             if let Err(e) = stream.set_nodelay(true) {
@@ -2033,6 +2073,12 @@ async fn run(args: Args) -> anyhow::Result<()> {
     Ok(())
 }
 async fn checkpoint(app: App) -> anyhow::Result<()> {
+    let flag = app.checkpoint_failed.clone();
+    let result = checkpoint_once(app).await;
+    flag.store(result.is_err(), std::sync::atomic::Ordering::Release);
+    result
+}
+async fn checkpoint_once(app: App) -> anyhow::Result<()> {
     tokio::task::spawn_blocking(move || {
         let mut db = app
             .db
@@ -2081,6 +2127,8 @@ mod tests {
             audit: audit::Retention::default(),
             nonces: actor::Nonces::default(),
             allow_expired_keep: 30 * 86_400,
+            tls: None,
+            checkpoint_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             native_source: None,
             network_source: Arc::new(arc_swap::ArcSwapOption::empty()),
             network_source_phase: Arc::new(std::sync::atomic::AtomicU8::new(0)),

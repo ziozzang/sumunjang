@@ -36,6 +36,8 @@ ring = "0.17"
 base64 = "0.22"
 ipnet = "2"
 prost = "0.14"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
 
 guard-update = { path = "../guard-update" }
 libc = "0.2"

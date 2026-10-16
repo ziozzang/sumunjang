@@ -53,7 +53,7 @@ fn status(app: &App, header: &[u8]) -> u16 {
     }
     match path {
         "/healthz" => 200,
-        "/readyz" if app.source_remaining(&app.view.load()).is_some() => 200,
+        "/readyz" if app.ready_reason().is_none() => 200,
         "/readyz" => 503,
         _ => 404,
     }

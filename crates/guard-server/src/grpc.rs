@@ -5,13 +5,12 @@ use guard_grpc::v1::{
     NetworkEvidence, NetworkReply, NetworkRequest,
     network_server::{Network, NetworkServer},
 };
-pub use hangang_runtime::configuration;
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::Arc,
 };
 use tokio::{net::TcpListener, sync::Semaphore};
-use tonic::{Request, Response, Status, transport::ServerTlsConfig};
+use tonic::{Request, Response, Status};
 
 struct Service {
     app: App,
@@ -206,16 +205,110 @@ impl Service {
         }
     }
 }
+/// One mTLS connection; the handshake used the material current at accept time.
+pub(crate) struct TlsConnection {
+    stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+impl tonic::transport::server::Connected for TlsConnection {
+    type ConnectInfo = tonic::transport::server::TcpConnectInfo;
+    fn connect_info(&self) -> Self::ConnectInfo {
+        self.stream.get_ref().0.connect_info()
+    }
+}
+impl tokio::io::AsyncRead for TlsConnection {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().stream).poll_read(cx, buf)
+    }
+}
+impl tokio::io::AsyncWrite for TlsConnection {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().stream).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().stream).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().stream).poll_shutdown(cx)
+    }
+}
+/// Accept with the connection bound (2,048) of `hangang_runtime::incoming` and
+/// complete mandatory-mTLS handshakes concurrently (3 s each) with the current
+/// reloadable material; only ALPN `h2` sessions reach tonic.
+fn tls_incoming(
+    listener: TcpListener,
+    tls: crate::tls_reload::AcceptorSource,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) -> tokio_stream::wrappers::ReceiverStream<std::io::Result<TlsConnection>> {
+    let (tx, rx) = tokio::sync::mpsc::channel(256);
+    tokio::spawn(async move {
+        let connections = Arc::new(Semaphore::new(2048));
+        loop {
+            let accepted = tokio::select! {
+                accepted = listener.accept() => accepted,
+                _ = stop.changed() => break,
+            };
+            let Ok((socket, _)) = accepted else { continue };
+            let Ok(permit) = connections.clone().try_acquire_owned() else {
+                continue;
+            };
+            if socket.set_nodelay(true).is_err() {
+                continue;
+            }
+            let acceptor = tls.acceptor();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                if let Ok(Ok(stream)) =
+                    tokio::time::timeout(std::time::Duration::from_secs(3), acceptor.accept(socket))
+                        .await
+                    && stream.get_ref().1.alpn_protocol() == Some(b"h2".as_slice())
+                    && stream
+                        .get_ref()
+                        .1
+                        .peer_certificates()
+                        .is_some_and(|c| !c.is_empty())
+                {
+                    let _ = tx
+                        .send(Ok(TlsConnection {
+                            stream,
+                            _permit: permit,
+                        }))
+                        .await;
+                }
+            });
+        }
+    });
+    tokio_stream::wrappers::ReceiverStream::new(rx)
+}
 pub async fn serve(
     listener: TcpListener,
-    tls: ServerTlsConfig,
+    tls: crate::tls_reload::AcceptorSource,
     app: App,
     mut stop: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
-    let incoming = hangang_runtime::incoming(listener);
+    let incoming = tls_incoming(listener, tls, stop.clone());
     // Separate predecode budget, shared by every connection to this listener.
     let ingress = Arc::new(Semaphore::new(app.max_http_requests.min(256)));
-    hangang_runtime::server(tls)?
+    // Same bounds as hangang_runtime::server; TLS terminates in tls_incoming.
+    tonic::transport::Server::builder()
+        .concurrency_limit_per_connection(64)
+        .max_concurrent_streams(Some(64))
+        .http2_max_header_list_size(Some(8192))
+        .timeout(std::time::Duration::from_millis(1000))
         .add_service(authenticate_transport(
             hangang_runtime::unary_ingress::UnaryIngress::new(
                 NetworkServer::new(Service {
