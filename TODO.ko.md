@@ -576,3 +576,16 @@ ASN 제안 흐름, 클라이언트 이전 후 무조건 룰 쓰기 제거.
 
 정책 문서 리비전(lineage+순번)도 같은 방식으로 저장하여 정책·허용 목록 CAS도
 재시작 후 유지된다.
+
+## 네트워크 존 — 2026-10-17
+
+브랜치 `feat/network-zones`(`feat/console-api-gaps` 기반, 로컬만, push·배포 안 함)는
+수문장 소유 `NetworkZone`(ADR 0021/0022)을 구현했다. 표시 이름·설명·소유자가 있는
+이름 붙은 IPv4/IPv6 접두어 집합이며 Pumgye 계약 한도(존 64개, 접두어 65,536개,
+`[A-Za-z0-9_.:-]{1,128}`)를 따른다. 저장되는 단조 존 리비전, CAS·사유·감사 관리 API
+(`/v1/zones`), Pumgye 계약 그대로의 스냅샷(`/v1/zones/snapshot`, 리비전·해시 헤더,
+ADR 0021 P1 전까지 서명 없음), 할당 없는 존 마스크 트리(no_alloc 확장), explain
+`zone` 단계와 HTTP/gRPC 근거 존 ID를 제공한다. 콘솔 패키지 0.1.7은 브로커 경로 32개를
+모두 쓴다. 코어 46·no_alloc 2·서버 82개 테스트와 Clippy가 통과했다. 남은 일: ADR 0022
+NetworkZone/NetworkControl CRD 원천, 서명된 스냅샷 조회(PPG2/HGD), Pumgye 가져오기
+자동화, 브로커 경로 한도(플러그인 계약 v2).

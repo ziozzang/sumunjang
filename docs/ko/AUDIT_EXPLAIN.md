@@ -22,6 +22,7 @@ gRPC·HTTP 판정에 추가되는 근거(evidence)를 제공한다. 별도 표�
 | `update.check` | `POST /v1/update/check` |
 | `allowlist.add`, `allowlist.remove` | `POST`/`DELETE /v1/allowlist` |
 | `allowlist.expire` | 오래 만료된 허용 항목 자동 삭제(행위자 `system`) |
+| `zones.upsert`, `zones.remove` | `POST`/`DELETE /v1/zones` |
 | `kubernetes.authority.publish` | 내용이 바뀐 네이티브 `--kubernetes-authority` 게시 |
 | `startup.import` | 시작 시 `--policy`, `--bootstrap-policy`, `--asn-catalog`가 저장 상태를 바꾼 경우 |
 

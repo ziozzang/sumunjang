@@ -89,3 +89,10 @@ Package 0.1.6 adds `rules/document` (GET), `history/query` and
 `asn/catalog/query` (POST, read-only) and `allowlist` (GET; POST and DELETE as
 mutations). Prefer the compare-and-set rules and allowlist writes; see
 [console Network APIs](CONSOLE_NETWORK_API.md).
+
+## Zone routes (package 0.1.7)
+
+Package 0.1.7 adds `zones` (GET) and `zones` (POST, mutation; upsert or remove)
+and drops the duplicate `audit` GET route (use `audit/query`). The broker's
+32-route limit is now fully used; further routes need a broker contract change
+(ADR 0020 plugin contract v2). See [network zones](NETWORK_ZONES.md).

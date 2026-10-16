@@ -23,6 +23,7 @@ Every administrative mutation writes one audit row:
 | `update.check` | `POST /v1/update/check` |
 | `allowlist.add`, `allowlist.remove` | `POST`/`DELETE /v1/allowlist` |
 | `allowlist.expire` | automatic removal of long-expired allow entries (actor `system`) |
+| `zones.upsert`, `zones.remove` | `POST`/`DELETE /v1/zones` |
 | `kubernetes.authority.publish` | native `--kubernetes-authority` publication whose content changed |
 | `startup.import` | `--policy`, `--bootstrap-policy`, `--asn-catalog` changing stored state at startup |
 

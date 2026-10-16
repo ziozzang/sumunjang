@@ -650,3 +650,18 @@ survives restarts. Core 43 + no_alloc 2 and server 79 tests and Clippy pass.
 
 The policy document revision (lineage + sequence) is now persisted the same
 way, so policy and allowlist compare-and-set also survive restarts.
+
+## Network zones — 2026-10-17
+
+Branch `feat/network-zones` (on `feat/console-api-gaps`; local, not pushed or
+deployed) implements Sumunjang-owned `NetworkZone` (ADR 0021/0022): named
+IPv4/IPv6 prefix sets with display name, description and owner, bounded to the
+Pumgye contract (≤ 64 zones, ≤ 65,536 prefixes, `[A-Za-z0-9_.:-]{1,128}`), a
+persisted monotonic zone revision, CAS + reason + audit admin API
+(`/v1/zones`), the exact Pumgye snapshot (`/v1/zones/snapshot`, revision and
+digest headers, unsigned until ADR 0021 P1), an allocation-free zone mask trie
+(no_alloc extended), explain `zone` stage and HTTP/gRPC evidence zone ids.
+Console package 0.1.7 uses all 32 broker routes. Core 46 + no_alloc 2 and
+server 82 tests and Clippy pass. Open: ADR 0022 NetworkZone/NetworkControl CRD
+source, signed snapshot fetch (PPG2/HGD), Pumgye import automation, broker
+route limit (plugin contract v2).

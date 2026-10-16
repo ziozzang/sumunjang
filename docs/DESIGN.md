@@ -112,6 +112,8 @@ Admin endpoints (admin bearer only):
   the live evaluation path and the reason catalog. See AUDIT_EXPLAIN.md.
 - GET /v1/history, GET/POST/DELETE /v1/allowlist, GET /v1/rules/document,
   GET /v1/asn/catalog: console Network APIs. See CONSOLE_NETWORK_API.md.
+- GET/POST/DELETE /v1/zones, GET /v1/zones/snapshot, POST /v1/zones/lookup:
+  network zones and the Pumgye zone snapshot. See NETWORK_ZONES.md.
 - Dashboard /: static HTML, credential entered in browser memory only; no local
   storage, embedded token, external scripts or unsanitized evidence HTML.
 

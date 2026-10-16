@@ -60,3 +60,7 @@ Check는 판정 전에 정확한 불변 정책 view와 필요한 경우 GeoIP �
 싱크를 쓴다. 플래그 없는 요청은 `NoTrace` 경로를 유지한다. HGD1은 바뀌지 않고 근거를
 싣지 않는다. 차단 네트워크는 주소이므로 이벤트 내보내기 측에서 가명화해야 한다.
 [감사·explain](AUDIT_EXPLAIN.md) 참고.
+
+존 근거: `NetworkEvidence.zone_ids`(10), `zone_ids_truncated`(11),
+`zone_revision`(12)은 주소를 포함하는 네트워크 존을 나열한다(최대 8개, 1KiB 인코딩
+한계에 맞게 줄임). [네트워크 존](NETWORK_ZONES.md) 참고.

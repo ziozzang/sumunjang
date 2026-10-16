@@ -69,3 +69,10 @@ revision과 일치하지 않습니다. 오래된 체크포인트를 복원하면
 패키지 0.1.6은 `rules/document`(GET), `history/query`·`asn/catalog/query`(POST, 읽기
 전용), `allowlist`(GET, POST·DELETE는 변경)를 추가한다. 룰·허용 목록은 CAS 쓰기를
 권장한다. [콘솔 네트워크 API](CONSOLE_NETWORK_API.md) 참고.
+
+## 존 경로(패키지 0.1.7)
+
+패키지 0.1.7은 `zones`(GET)와 `zones`(POST, 변경: 생성·교체 또는 삭제)를 추가하고
+중복인 `audit` GET 경로를 뺐다(`audit/query` 사용). 브로커 경로 한도 32개를 모두
+사용하므로 더 추가하려면 브로커 계약 변경(ADR 0020 플러그인 계약 v2)이 필요하다.
+[네트워크 존](NETWORK_ZONES.md) 참고.

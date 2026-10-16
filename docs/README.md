@@ -20,6 +20,7 @@ Hopae owns users/principals. Guard decisions do not replace authentication.
 | Signed updates | [Updates](UPDATES.md) | [업데이트](ko/UPDATES.md) |
 | Audit, explain and evidence | [Audit/explain](AUDIT_EXPLAIN.md) | [감사·explain](ko/AUDIT_EXPLAIN.md) |
 | Console Network APIs | [Network APIs](CONSOLE_NETWORK_API.md) | [네트워크 API](ko/CONSOLE_NETWORK_API.md) |
+| Network zones | [Zones](NETWORK_ZONES.md) | [네트워크 존](ko/NETWORK_ZONES.md) |
 | Backlog | [TODO](../TODO.md) | [TODO](../TODO.ko.md) |
 
 [Hangang console integration](CONSOLE.md)

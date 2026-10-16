@@ -83,3 +83,7 @@ the fixed-size, allocation-free `Evidence` sink; requests without the flag keep
 the `NoTrace` path. HGD1 is unchanged and carries no evidence. Block networks are
 addresses: event exporters must pseudonymize them. See
 [audit and explain](AUDIT_EXPLAIN.md).
+
+Zone evidence: `NetworkEvidence.zone_ids` (10), `zone_ids_truncated` (11) and
+`zone_revision` (12) list the network zones containing the address (≤ 8, trimmed
+to the 1 KiB encode bound). See [network zones](NETWORK_ZONES.md).
