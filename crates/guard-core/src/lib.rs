@@ -1,5 +1,8 @@
+pub mod reasons;
 pub mod rules;
+pub mod trace;
 use rules::CompiledRules;
+use trace::{AsnSource, DecidingStage, NoTrace, TraceEvent, Tracer};
 pub use rules::{GeoContext, Rule, RuleAction, RuleSet, Suspicion};
 pub mod network_policy;
 pub mod pod_peers;
@@ -122,7 +125,68 @@ pub fn canonical_network(value: &str) -> Result<IpNet> {
     }
     Ok(net.trunc())
 }
+/// A validation problem located by a JSON Pointer relative to the document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FieldError {
+    pub path: String,
+    pub message: String,
+}
+impl FieldError {
+    pub fn new(path: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            message: message.into(),
+        }
+    }
+}
+/// Maximum diagnostics reported for one document.
+pub const MAX_FIELD_ERRORS: usize = 64;
 impl Policy {
+    /// Every validation problem with its JSON Pointer, without normalizing.
+    /// An empty result means [`Policy::validate`] accepts the policy.
+    pub fn diagnose(&self) -> Vec<FieldError> {
+        let mut errors = Vec::new();
+        if !(1..=3600).contains(&self.window_secs) {
+            errors.push(FieldError::new("/window_secs", "window outside 1..3600"));
+        }
+        if !(1..=1_000_000).contains(&self.threshold) {
+            errors.push(FieldError::new("/threshold", "invalid threshold"));
+        }
+        if !(1..=604800).contains(&self.block_ttl_secs) {
+            errors.push(FieldError::new("/block_ttl_secs", "invalid block TTL"));
+        }
+        if self.allow.len() > MAX_BLOCKS {
+            errors.push(FieldError::new("/allow", "too many allow rules"));
+        }
+        for (name, w) in [
+            ("honeypot", self.weights.honeypot),
+            ("scanner", self.weights.scanner),
+            ("auth_failure", self.weights.auth_failure),
+            ("invalid_request", self.weights.invalid_request),
+        ] {
+            if w > 1000 {
+                errors.push(FieldError::new(
+                    format!("/weights/{name}"),
+                    "weight exceeds 1000",
+                ));
+            }
+        }
+        let mut seen = HashSet::new();
+        for (i, n) in self.allow.iter().enumerate() {
+            if errors.len() >= MAX_FIELD_ERRORS {
+                break;
+            }
+            match canonical_network(n) {
+                Ok(n) if !seen.insert(n) => {
+                    errors.push(FieldError::new(format!("/allow/{i}"), "duplicate allow rule"))
+                }
+                Ok(_) => {}
+                Err(e) => errors.push(FieldError::new(format!("/allow/{i}"), e.to_string())),
+            }
+        }
+        errors.truncate(MAX_FIELD_ERRORS);
+        errors
+    }
     pub fn validate(&mut self) -> Result<()> {
         ensure!(
             (1..=3600).contains(&self.window_secs),
@@ -252,6 +316,26 @@ impl Engine {
     }
     pub fn stats(&self) -> Stats {
         self.stats.clone()
+    }
+    /// Validate a policy exactly as [`Engine::set_policy`] would, without applying it.
+    pub fn check_policy(&self, mut policy: Policy) -> Result<Policy> {
+        policy.validate()?;
+        ensure!(
+            snapshot_budget(&policy, self.blocks.values().map(AsRef::as_ref)) <= 4_000_000,
+            "snapshot byte budget exceeded"
+        );
+        Ok(policy)
+    }
+    /// Current signal score of an exact IP from bounded aggregates.
+    pub fn signal_score(&mut self, ip: IpAddr, now: u64) -> u64 {
+        self.prune(now);
+        self.aggregates.get(&ip.to_string()).map_or(0, |a| {
+            a.buckets.values().fold(0u64, |s, b| s.saturating_add(b.0))
+        })
+    }
+    /// Active blocks (for audit digests and summaries).
+    pub fn blocks(&self) -> impl Iterator<Item = &Block> {
+        self.blocks.values().map(AsRef::as_ref)
     }
     pub fn set_policy(&mut self, mut policy: Policy) -> Result<()> {
         policy.validate()?;
@@ -854,40 +938,79 @@ impl DecisionView {
     pub fn decision(&self, ip: IpAddr, now: u64) -> DecisionRef<'_> {
         self.query_ip(ip, now)
     }
+    /// Live decision with a tracer. `query_ip_context` is exactly this with
+    /// [`NoTrace`]; explain and decision evidence pass their own sink.
+    pub fn evaluate<'a, T: Tracer<'a>>(
+        &'a self,
+        ip: IpAddr,
+        now: u64,
+        geo: GeoContext<'_>,
+        trace: &mut T,
+    ) -> DecisionRef<'a> {
+        self.evaluate_as(self.mode, ip, now, geo, trace)
+    }
+    /// Evaluate as if the view were in `mode` (used to show what enforcement of
+    /// the same published policy would decide while it is observed).
+    pub fn evaluate_as<'a, T: Tracer<'a>>(
+        &'a self,
+        mode: Mode,
+        ip: IpAddr,
+        now: u64,
+        geo: GeoContext<'_>,
+        trace: &mut T,
+    ) -> DecisionRef<'a> {
+        evaluate(
+            &self.allow,
+            &self.blocks,
+            &self.rules,
+            &self.asns,
+            self.revision,
+            mode,
+            ip,
+            now,
+            geo,
+            trace,
+        )
+    }
+    /// Offline ASN catalog fallback for evidence/explain display.
+    pub fn catalog_asn(&self, ip: IpAddr) -> Option<u32> {
+        self.asns.longest(ip).copied()
+    }
+    /// Sum of scores and IDs of every active matching rule, independent of the
+    /// decision (the inspection score used by `POST /v1/lookup`).
+    pub fn rule_score(&self, ip: IpAddr, now: u64, geo: GeoContext<'_>) -> (u64, Vec<String>) {
+        let geo = GeoContext {
+            country: geo.country,
+            asn: geo.asn.or_else(|| self.asns.longest(ip).copied()),
+        };
+        let m = self.rules.matching(ip, now, geo);
+        (m.score, self.rules.matching_ids(&m))
+    }
+    /// Rule set compiled into this view, in precedence order.
+    pub fn compiled_rules(&self) -> &[Rule] {
+        &self.rules.rules
+    }
+    /// A never-published view combining a candidate policy (mode and allowlist)
+    /// and/or candidate rules with this view's blocks and ASN catalog. Inputs must
+    /// already be validated (see [`Engine::check_policy`] and [`RuleSet::validate`]).
+    pub fn with_candidate(&self, policy: Option<&Policy>, rules: Option<&RuleSet>) -> Result<Self> {
+        let mut view = self.clone();
+        if let Some(policy) = policy {
+            let mut allow = PrefixTrie::default();
+            for n in &policy.allow {
+                allow.insert(canonical_network(n)?, ());
+            }
+            view.allow = allow;
+            view.mode = policy.mode;
+        }
+        if let Some(rules) = rules {
+            view.rules = Arc::new(CompiledRules::new(rules)?);
+        }
+        Ok(view)
+    }
     pub fn allocated_bytes(&self) -> usize {
         self.allow.allocated_bytes() + self.blocks.allocated_bytes()
     }
-}
-fn query_indices<'a>(
-    allow: &PrefixTrie<()>,
-    blocks: &'a PrefixTrie<Arc<Block>>,
-    revision: u64,
-    mode: Mode,
-    ip: IpAddr,
-    now: u64,
-) -> DecisionRef<'a> {
-    let mut d = DecisionRef {
-        version: 1,
-        revision,
-        action: "allow",
-        mode,
-        reason: None,
-        ttl_ms: 5000,
-    };
-    if mode == Mode::Enforce
-        && allow.longest(ip).is_none()
-        && let Some(b) = blocks.longest_where(ip, |b| b.expires_at > now)
-    {
-        d.action = "deny";
-        d.reason = Some(&b.reason);
-        d.ttl_ms = b
-            .expires_at
-            .saturating_sub(now)
-            .saturating_sub(1)
-            .saturating_mul(1000)
-            .min(5000);
-    }
-    d
 }
 impl Engine {
     pub fn revision(&self) -> u64 {
@@ -1084,6 +1207,7 @@ mod asn_index_tests {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[inline]
 fn query_rules<'a>(
     allow: &PrefixTrie<()>,
     blocks: &'a PrefixTrie<Arc<Block>>,
@@ -1095,9 +1219,36 @@ fn query_rules<'a>(
     now: u64,
     geo: GeoContext<'_>,
 ) -> DecisionRef<'a> {
-    if rules.rules.is_empty() {
-        return query_indices(allow, blocks, revision, mode, ip, now);
-    }
+    evaluate(
+        allow,
+        blocks,
+        rules,
+        catalog,
+        revision,
+        mode,
+        ip,
+        now,
+        geo,
+        &mut NoTrace,
+    )
+}
+
+/// The single network decision function. Every live transport (HTTP, HGD1, gRPC),
+/// decision evidence and administrative explain call it; only the tracer differs.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn evaluate<'a, T: Tracer<'a>>(
+    allow: &PrefixTrie<()>,
+    blocks: &'a PrefixTrie<Arc<Block>>,
+    rules: &'a CompiledRules,
+    catalog: &PrefixTrie<u32>,
+    revision: u64,
+    mode: Mode,
+    ip: IpAddr,
+    now: u64,
+    geo: GeoContext<'_>,
+    trace: &mut T,
+) -> DecisionRef<'a> {
     let mut d = DecisionRef {
         version: 1,
         revision,
@@ -1106,47 +1257,83 @@ fn query_rules<'a>(
         reason: None,
         ttl_ms: 5000,
     };
-    if mode != Mode::Enforce || allow.longest(ip).is_some() {
+    trace.event(TraceEvent::Mode { mode });
+    if mode != Mode::Enforce {
+        trace.event(TraceEvent::Outcome {
+            stage: DecidingStage::Observe,
+        });
         return d;
     }
-    let geo = if geo.asn.is_none() && rules.requires_asn() {
-        GeoContext {
-            country: geo.country,
-            asn: catalog.longest(ip).copied(),
-        }
-    } else {
-        geo
-    };
-    let matched = rules.matching(ip, now, geo);
-    if let Some(rule) = matched.winner {
-        if let Some(e) = rule.expires_at {
-            d.ttl_ms = d
-                .ttl_ms
-                .min(e.saturating_sub(now).saturating_sub(1).saturating_mul(1000));
-        }
-        match rule.action {
-            RuleAction::Observe => {}
-            RuleAction::Allow => {
-                if let Some(e) = rule.expires_at {
-                    d.ttl_ms = d
-                        .ttl_ms
-                        .min(e.saturating_sub(now).saturating_sub(1).saturating_mul(1000));
-                }
-                return d;
+    let allowed = allow.longest_prefix_where(ip, |_| true);
+    trace.event(TraceEvent::Allowlist {
+        prefix_len: allowed.map(|(bits, _)| bits),
+    });
+    if allowed.is_some() {
+        trace.event(TraceEvent::Outcome {
+            stage: DecidingStage::Allowlist,
+        });
+        return d;
+    }
+    if !rules.rules.is_empty() {
+        let mut asn_source = if geo.asn.is_some() {
+            AsnSource::Geoip
+        } else {
+            AsnSource::None
+        };
+        let geo = if geo.asn.is_none() && rules.requires_asn() {
+            let asn = catalog.longest(ip).copied();
+            if asn.is_some() {
+                asn_source = AsnSource::Catalog;
             }
-            RuleAction::Deny => {
-                d.action = "deny";
-                d.reason = Some(&rule.id);
-                if let Some(e) = rule.expires_at {
-                    d.ttl_ms = d
-                        .ttl_ms
-                        .min(e.saturating_sub(now).saturating_sub(1).saturating_mul(1000));
+            GeoContext {
+                country: geo.country,
+                asn,
+            }
+        } else {
+            geo
+        };
+        trace.event(TraceEvent::Geo {
+            country: geo.country.and_then(rules::country_key),
+            asn: geo.asn,
+            asn_source,
+        });
+        let matched = rules.matching_traced(ip, now, geo, trace);
+        if let Some(rule) = matched.winner {
+            if let Some(e) = rule.expires_at {
+                d.ttl_ms = d
+                    .ttl_ms
+                    .min(e.saturating_sub(now).saturating_sub(1).saturating_mul(1000));
+            }
+            match rule.action {
+                RuleAction::Observe => {}
+                RuleAction::Allow => {
+                    trace.event(TraceEvent::Outcome {
+                        stage: DecidingStage::Rule,
+                    });
+                    return d;
                 }
-                return d;
+                RuleAction::Deny => {
+                    d.action = "deny";
+                    d.reason = Some(&rule.id);
+                    trace.event(TraceEvent::Outcome {
+                        stage: DecidingStage::Rule,
+                    });
+                    return d;
+                }
             }
         }
     }
-    if let Some(block) = blocks.longest_where(ip, |b| b.expires_at > now) {
+    let block = blocks.longest_where(ip, |b| {
+        let active = b.expires_at > now;
+        if !active {
+            trace.event(TraceEvent::BlockExpired { block: b.as_ref() });
+        }
+        active
+    });
+    trace.event(TraceEvent::Block {
+        block: block.map(AsRef::as_ref),
+    });
+    if let Some(block) = block {
         d.action = "deny";
         d.reason = Some(&block.reason);
         d.ttl_ms = d.ttl_ms.min(
@@ -1156,6 +1343,13 @@ fn query_rules<'a>(
                 .saturating_sub(1)
                 .saturating_mul(1000),
         );
+        trace.event(TraceEvent::Outcome {
+            stage: DecidingStage::Block,
+        });
+    } else {
+        trace.event(TraceEvent::Outcome {
+            stage: DecidingStage::Default,
+        });
     }
     d
 }
@@ -1325,5 +1519,113 @@ mod publication_revision_tests {
         assert!(engine.advance_revision_past(u64::MAX).is_err());
         assert_eq!(engine.revision(), 102);
         assert_eq!(engine.decision("192.0.2.1", 1).unwrap().action, "deny");
+    }
+}
+
+#[cfg(test)]
+mod explain_support_tests {
+    use super::*;
+    use trace::{Evidence, reason_code};
+    #[test]
+    fn diagnostics_locate_every_problem_and_agree_with_validation() {
+        let policy = Policy {
+            window_secs: 0,
+            allow: vec!["192.0.2.0/24".into(), "bad".into(), "192.0.2.9/24".into()],
+            weights: Weights {
+                scanner: 1001,
+                ..Weights::default()
+            },
+            ..Policy::default()
+        };
+        let paths: Vec<_> = policy.diagnose().into_iter().map(|e| e.path).collect();
+        assert_eq!(
+            paths,
+            ["/window_secs", "/weights/scanner", "/allow/1", "/allow/2"]
+        );
+        assert!(policy.clone().validate().is_err());
+        assert!(Policy::default().diagnose().is_empty());
+        let ok = RuleSet {
+            version: 1,
+            rules: vec![Rule {
+                id: "a".into(),
+                priority: 0,
+                network: Some("192.0.2.1/24".into()),
+                countries: vec!["kr".into()],
+                asns: vec![1],
+                action: RuleAction::Deny,
+                score: 0,
+                expires_at: None,
+                description: String::new(),
+            }],
+        };
+        assert!(ok.diagnose().is_empty());
+        ok.clone().validate().unwrap();
+        let mut bad = ok.clone();
+        bad.rules.push(bad.rules[0].clone());
+        bad.rules[1].countries = vec!["KR".into(), "kr".into(), "K1".into()];
+        bad.rules[1].asns = vec![0];
+        bad.rules[1].network = Some("x".into());
+        let errors = bad.diagnose();
+        let paths: Vec<_> = errors.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "/rules/1/id",
+                "/rules/1/network",
+                "/rules/1/countries/1",
+                "/rules/1/countries/2",
+                "/rules/1/asns/0"
+            ]
+        );
+        assert!(bad.validate().is_err());
+    }
+    #[test]
+    fn candidate_view_is_isolated_and_reason_codes_are_stable() {
+        let mut e = Engine::new(Policy {
+            mode: Mode::Enforce,
+            ..Policy::default()
+        })
+        .unwrap();
+        e.add_block(
+            Block {
+                network: "203.0.113.0/24".into(),
+                expires_at: 1000,
+                reason: trace::AUTOMATIC_BLOCK_REASON.into(),
+            },
+            100,
+        )
+        .unwrap();
+        let view = e.decision_view();
+        let ip: IpAddr = "203.0.113.5".parse().unwrap();
+        let candidate = e
+            .check_policy(Policy {
+                mode: Mode::Enforce,
+                allow: vec!["203.0.113.0/28".into()],
+                ..Policy::default()
+            })
+            .unwrap();
+        let cv = view.with_candidate(Some(&candidate), None).unwrap();
+        assert_eq!(cv.query_ip(ip, 100).action, "allow");
+        assert_eq!(view.query_ip(ip, 100).action, "deny");
+        assert_eq!(e.decision(&ip.to_string(), 100).unwrap().action, "deny");
+        let mut ev = Evidence::default();
+        view.evaluate(ip, 100, GeoContext::default(), &mut ev);
+        assert_eq!(
+            reason_code(ev.stage.unwrap(), ev.winner, ev.block),
+            "sumunjang.deny.block_automatic"
+        );
+        let mut ev = Evidence::default();
+        cv.evaluate(ip, 100, GeoContext::default(), &mut ev);
+        assert!(ev.allowlisted);
+        assert_eq!(
+            reason_code(ev.stage.unwrap(), ev.winner, ev.block),
+            "sumunjang.allow.allowlist"
+        );
+        for code in [
+            reason_code(trace::DecidingStage::Observe, None, None),
+            reason_code(trace::DecidingStage::Default, None, None),
+        ] {
+            assert!(reasons::DECISION_CODES.contains(&code));
+        }
     }
 }

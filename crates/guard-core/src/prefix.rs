@@ -209,7 +209,7 @@ impl<T> PrefixTrie<T> {
         self.longest_where(ip, |_| true)
     }
     /// Visit every matching prefix from broad to specific, without allocation.
-    pub fn visit_matches(&self, ip: IpAddr, mut visit: impl FnMut(&T)) {
+    pub fn visit_matches<'s>(&'s self, ip: IpAddr, mut visit: impl FnMut(&'s T)) {
         let (family, key) = ip_key(ip);
         let mut id = self.roots[family];
         while let Some(current) = id {
@@ -228,7 +228,21 @@ impl<T> PrefixTrie<T> {
     }
     /// A rejected more specific value does not hide an accepted broader prefix.
     #[inline]
-    pub fn longest_where(&self, ip: IpAddr, mut accept: impl FnMut(&T) -> bool) -> Option<&T> {
+    pub fn longest_where<'s>(
+        &'s self,
+        ip: IpAddr,
+        accept: impl FnMut(&'s T) -> bool,
+    ) -> Option<&'s T> {
+        self.longest_prefix_where(ip, accept).map(|(_, value)| value)
+    }
+    /// Like [`Self::longest_where`], also returning the accepted prefix length in
+    /// the address family of `ip` (IPv4 and IPv4-mapped IPv6 report 0..=32).
+    #[inline]
+    pub fn longest_prefix_where<'s>(
+        &'s self,
+        ip: IpAddr,
+        mut accept: impl FnMut(&'s T) -> bool,
+    ) -> Option<(u8, &'s T)> {
         let (family, key) = ip_key(ip);
         let mut id = self.roots[family];
         let mut best = None;
@@ -240,7 +254,7 @@ impl<T> PrefixTrie<T> {
             if let Some(value) = &node.value
                 && accept(value)
             {
-                best = Some(value);
+                best = Some((node.bits, value));
             }
             if node.bits == 128 || (family == 0 && node.bits == 32) {
                 break;

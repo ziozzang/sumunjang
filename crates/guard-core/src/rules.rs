@@ -1,4 +1,8 @@
-use crate::{canonical_network, prefix::PrefixTrie};
+use crate::{
+    canonical_network,
+    prefix::PrefixTrie,
+    trace::{NoTrace, TraceEvent, Tracer},
+};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -49,6 +53,81 @@ impl Default for RuleSet {
     }
 }
 impl RuleSet {
+    /// Every validation problem with its JSON Pointer, without normalizing.
+    /// An empty result means [`RuleSet::validate`] accepts the rule set.
+    pub fn diagnose(&self) -> Vec<crate::FieldError> {
+        use crate::FieldError as E;
+        let mut errors = Vec::new();
+        if self.version != 1 {
+            errors.push(E::new("/version", "unsupported rules version"));
+        }
+        if self.rules.len() > MAX_RULES {
+            errors.push(E::new("/rules", "rules capacity exceeded"));
+        }
+        let mut ids = HashSet::new();
+        for (i, r) in self.rules.iter().enumerate() {
+            if errors.len() >= crate::MAX_FIELD_ERRORS {
+                break;
+            }
+            let at = |field: &str| format!("/rules/{i}/{field}");
+            if r.id.is_empty()
+                || r.id.len() > 64
+                || !r
+                    .id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+            {
+                errors.push(E::new(at("id"), "invalid rule ID"));
+            } else if !ids.insert(r.id.as_str()) {
+                errors.push(E::new(at("id"), "duplicate rule ID"));
+            }
+            if r.description.len() > 256 {
+                errors.push(E::new(at("description"), "rule description exceeds 256 bytes"));
+            }
+            if r.score > 1_000_000 {
+                errors.push(E::new(at("score"), "rule score exceeds 1000000"));
+            }
+            if r.countries.len() > 256 {
+                errors.push(E::new(at("countries"), "rule matcher capacity exceeded"));
+            }
+            if r.asns.len() > 256 {
+                errors.push(E::new(at("asns"), "rule matcher capacity exceeded"));
+            }
+            if r.network.is_none() && r.countries.is_empty() && r.asns.is_empty() {
+                errors.push(E::new(format!("/rules/{i}"), "rule needs a condition"));
+            }
+            if let Some(n) = &r.network
+                && let Err(e) = canonical_network(n)
+            {
+                errors.push(E::new(at("network"), e.to_string()));
+            }
+            let mut countries = HashSet::new();
+            for (j, c) in r.countries.iter().enumerate().take(256) {
+                if c.len() != 2 || !c.bytes().all(|b| b.is_ascii_alphabetic()) {
+                    errors.push(E::new(
+                        format!("/rules/{i}/countries/{j}"),
+                        "country must be two ASCII letters",
+                    ));
+                } else if !countries.insert(c.to_ascii_uppercase()) {
+                    errors.push(E::new(
+                        format!("/rules/{i}/countries/{j}"),
+                        "duplicate country",
+                    ));
+                }
+            }
+            let mut asns = HashSet::new();
+            for (j, a) in r.asns.iter().enumerate().take(256) {
+                if *a == 0 || !asns.insert(*a) {
+                    errors.push(E::new(
+                        format!("/rules/{i}/asns/{j}"),
+                        "invalid or duplicate ASN",
+                    ));
+                }
+            }
+        }
+        errors.truncate(crate::MAX_FIELD_ERRORS);
+        errors
+    }
     pub fn validate(&mut self) -> Result<()> {
         ensure!(self.version == 1, "unsupported rules version");
         ensure!(self.rules.len() <= MAX_RULES, "rules capacity exceeded");
@@ -129,7 +208,7 @@ type Bits = [u64; 4];
 fn bit_set(bits: &mut Bits, i: usize) {
     bits[i / 64] |= 1u64 << (i % 64);
 }
-fn country_key(s: &str) -> Option<[u8; 2]> {
+pub(crate) fn country_key(s: &str) -> Option<[u8; 2]> {
     let b = s.as_bytes();
     if b.len() == 2 && b.iter().all(u8::is_ascii_alphabetic) {
         Some([b[0].to_ascii_uppercase(), b[1].to_ascii_uppercase()])
@@ -195,6 +274,17 @@ impl CompiledRules {
         self.requires_geo
     }
     pub fn matching(&self, ip: IpAddr, now: u64, geo: GeoContext<'_>) -> RuleMatches<'_> {
+        self.matching_traced(ip, now, geo, &mut NoTrace)
+    }
+    /// The one rule matcher; `trace` only observes matched and expired rules.
+    #[inline]
+    pub fn matching_traced<'a, T: Tracer<'a>>(
+        &'a self,
+        ip: IpAddr,
+        now: u64,
+        geo: GeoContext<'_>,
+        trace: &mut T,
+    ) -> RuleMatches<'a> {
         let mut network = Bits::default();
         self.network.visit_matches(ip, |bits| {
             for (n, b) in network.iter_mut().zip(bits) {
@@ -231,8 +321,13 @@ impl CompiledRules {
                 bits &= bits - 1;
                 let r = &self.rules[i];
                 if r.expires_at.is_some_and(|e| e <= now) {
+                    trace.event(TraceEvent::RuleExpired { rule: r });
                     continue;
                 }
+                trace.event(TraceEvent::RuleMatched {
+                    rule: r,
+                    winner: result.winner.is_none(),
+                });
                 if result.winner.is_none() {
                     result.winner = Some(r);
                 }
