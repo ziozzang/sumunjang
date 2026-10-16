@@ -1,7 +1,7 @@
 {
   "id": "guard",
   "name": "Sumunjang (\uc218\ubb38\uc7a5)",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "api_version": 1,
   "entry": "index.js",
   "assets": {
@@ -109,6 +109,31 @@
       "path": "update/check",
       "method": "POST",
       "mutation": true
+    },
+    {
+      "path": "audit",
+      "method": "GET",
+      "mutation": false
+    },
+    {
+      "path": "audit/query",
+      "method": "POST",
+      "mutation": false
+    },
+    {
+      "path": "explain",
+      "method": "POST",
+      "mutation": false
+    },
+    {
+      "path": "explain/batch",
+      "method": "POST",
+      "mutation": false
+    },
+    {
+      "path": "reasons",
+      "method": "GET",
+      "mutation": false
     }
   ]
 }
