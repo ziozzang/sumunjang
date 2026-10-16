@@ -97,6 +97,7 @@ fn main() {
                 rules_sequence: None,
                 policy_epoch: None,
                 policy_sequence: None,
+                zones: Default::default(),
                 policy: Policy {
                     mode: Mode::Enforce,
                     ..Policy::default()

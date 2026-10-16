@@ -2,6 +2,7 @@ pub mod history;
 pub mod reasons;
 pub mod rules;
 pub mod trace;
+pub mod zones;
 use rules::CompiledRules;
 pub use rules::{GeoContext, Rule, RuleAction, RuleSet, Suspicion};
 use trace::{AsnSource, DecidingStage, NoTrace, TraceEvent, Tracer};
@@ -384,6 +385,9 @@ pub struct State {
     pub policy_epoch: Option<String>,
     #[serde(default)]
     pub policy_sequence: Option<u64>,
+    /// Named network zones (revisioned, persisted).
+    #[serde(default)]
+    pub zones: zones::ZoneSet,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Stats {
@@ -421,6 +425,8 @@ pub struct Engine {
     rules_sequence: u64,
     rules_script: Option<String>,
     asn_catalog: Arc<Vec<AsnPrefix>>,
+    zones: zones::ZoneSet,
+    compiled_zones: Arc<zones::CompiledZones>,
     history: Arc<std::sync::Mutex<history::SignalHistory>>,
 }
 impl Engine {
@@ -454,6 +460,8 @@ impl Engine {
             rules_sequence: 1,
             rules_script: None,
             asn_catalog: Arc::new(Vec::new()),
+            zones: zones::ZoneSet::default(),
+            compiled_zones: Arc::new(zones::CompiledZones::default()),
             history: Arc::new(std::sync::Mutex::new(history::SignalHistory::new(
                 history::DEFAULT_RETENTION_SECS,
             ))),
@@ -478,6 +486,40 @@ impl Engine {
     /// Offline ASN catalog prefixes (canonical, sorted by ASN then network).
     pub fn asn_catalog(&self) -> &[AsnPrefix] {
         &self.asn_catalog
+    }
+    /// Administered network zones.
+    pub fn zones(&self) -> &zones::ZoneSet {
+        &self.zones
+    }
+    /// Create or replace one zone; bumps the zone and decision revisions.
+    pub fn set_zone(&mut self, mut zone: zones::Zone, now: u64, by: Option<&str>) -> Result<()> {
+        zone.normalize()?;
+        zone.updated_at = Some(now);
+        zone.updated_by = by.map(|b| b.chars().take(64).collect());
+        let mut next = self.zones.clone();
+        next.zones.insert(zone.id.clone(), zone);
+        self.install_zones(next)
+    }
+    /// Remove one zone; returns false when absent.
+    pub fn remove_zone(&mut self, id: &str) -> Result<bool> {
+        let mut next = self.zones.clone();
+        if next.zones.remove(id).is_none() {
+            return Ok(false);
+        }
+        self.install_zones(next)?;
+        Ok(true)
+    }
+    fn install_zones(&mut self, mut next: zones::ZoneSet) -> Result<()> {
+        next.revision = self
+            .zones
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("zone revision exhausted"))?;
+        next.validate()?;
+        self.compiled_zones = Arc::new(zones::CompiledZones::new(&next)?);
+        self.zones = next;
+        self.revision = self.revision.saturating_add(1);
+        Ok(())
     }
     /// Shared bounded per-address signal history.
     pub fn history(&self) -> Arc<std::sync::Mutex<history::SignalHistory>> {
@@ -878,6 +920,7 @@ impl Engine {
             rules_epoch: Some(self.rules_epoch.clone()),
             policy_epoch: Some(self.policy_epoch.clone()),
             policy_sequence: Some(self.policy_sequence),
+            zones: self.zones.clone(),
             rules_sequence: Some(self.rules_sequence),
         }
     }
@@ -899,6 +942,10 @@ impl Engine {
             "stored Lua source exceeds 32 KiB"
         );
         engine.rules_script = state.rules_script;
+        let mut zones = state.zones;
+        zones.validate()?;
+        engine.compiled_zones = Arc::new(zones::CompiledZones::new(&zones)?);
+        engine.zones = zones;
         if let (Some(epoch), Some(sequence)) = (state.policy_epoch, state.policy_sequence) {
             ensure!(
                 epoch.len() == 64 && epoch.bytes().all(|b| b.is_ascii_hexdigit()) && sequence > 0,
@@ -1222,6 +1269,7 @@ pub struct DecisionView {
     blocks: PrefixTrie<Arc<Block>>,
     rules: Arc<CompiledRules>,
     asns: Arc<PrefixTrie<u32>>,
+    zones: Arc<zones::CompiledZones>,
 }
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct DecisionRef<'a> {
@@ -1289,6 +1337,15 @@ impl DecisionView {
             trace,
         )
     }
+    /// Zone membership bitmask of `ip` (allocation-free; not part of decisions).
+    #[inline]
+    pub fn zone_mask(&self, ip: IpAddr) -> u64 {
+        self.zones.mask(ip)
+    }
+    /// Compiled zones of this view (names, revision).
+    pub fn zones(&self) -> &zones::CompiledZones {
+        &self.zones
+    }
     /// Offline ASN catalog fallback for evidence/explain display.
     pub fn catalog_asn(&self, ip: IpAddr) -> Option<u32> {
         self.asns.longest(ip).copied()
@@ -1346,6 +1403,7 @@ impl Engine {
             blocks: self.block_index.clone(),
             rules: self.compiled_rules.clone(),
             asns: self.asns.clone(),
+            zones: self.compiled_zones.clone(),
         }
     }
     pub fn decision(&self, ip: &str, now: u64) -> Result<Decision> {
@@ -2124,5 +2182,55 @@ mod console_gap_tests {
         p.threshold = 20;
         e.set_policy(p).unwrap();
         assert!(e.candidates(100).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod zone_engine_tests {
+    use super::*;
+    #[test]
+    fn zones_are_revisioned_persisted_and_published_in_views() {
+        let mut e = Engine::new(Policy::default()).unwrap();
+        let decision_revision = e.revision();
+        e.set_zone(
+            zones::Zone {
+                id: "corp".into(),
+                prefixes: vec!["10.0.0.1/8".into()],
+                ..Default::default()
+            },
+            100,
+            Some("operator"),
+        )
+        .unwrap();
+        assert_eq!(e.zones().revision, 1);
+        assert!(e.revision() > decision_revision);
+        assert_eq!(e.zones().zones["corp"].prefixes, ["10.0.0.0/8"]);
+        assert_eq!(
+            e.zones().zones["corp"].updated_by.as_deref(),
+            Some("operator")
+        );
+        assert!(
+            e.set_zone(
+                zones::Zone {
+                    id: "x y".into(),
+                    prefixes: vec!["10.0.0.0/8".into()],
+                    ..Default::default()
+                },
+                100,
+                None
+            )
+            .is_err()
+        );
+        assert_eq!(e.zones().revision, 1, "refused change keeps the revision");
+        let r = Engine::restore(e.state()).unwrap();
+        assert_eq!(r.zones(), e.zones());
+        let view = r.decision_view();
+        assert_eq!(view.zone_mask("10.2.3.4".parse().unwrap()), 1);
+        assert_eq!(view.zones().revision, 1);
+        let mut r = r;
+        assert!(r.remove_zone("corp").unwrap());
+        assert!(!r.remove_zone("corp").unwrap());
+        assert_eq!(r.zones().revision, 2);
+        assert_eq!(r.decision_view().zone_mask("10.2.3.4".parse().unwrap()), 0);
     }
 }

@@ -89,6 +89,21 @@ fn engine(mode: Mode, with_rules: bool) -> Engine {
         )
         .unwrap();
     }
+    for (id, prefixes) in [
+        ("corp", vec!["192.0.2.0/24", "2001:db8::/32"]),
+        ("office", vec!["192.0.2.0/26", "203.0.113.7/32"]),
+    ] {
+        e.set_zone(
+            guard_core::zones::Zone {
+                id: id.into(),
+                prefixes: prefixes.into_iter().map(str::to_owned).collect(),
+                ..Default::default()
+            },
+            100,
+            None,
+        )
+        .unwrap();
+    }
     if with_rules {
         let mut deny = rule("net-deny", RuleAction::Deny, 30);
         deny.network = Some("192.0.2.0/25".into());
@@ -159,12 +174,14 @@ fn production_and_evidence_paths_are_allocation_free_for_every_stage() {
     ];
     let mut stages = [0usize; 5];
     let mut denies = 0usize;
+    let mut zones_seen = 0u64;
     let count = allocations(|| {
         for view in &views {
             for ip in &ips {
                 for geo in geos {
                     for now in [100, 130, 2_000] {
                         let d = view.query_ip_context(*ip, now, geo);
+                        zones_seen |= view.zone_mask(*ip);
                         denies += usize::from(d.action == "deny");
                         std::hint::black_box(view.query_ip(*ip, now));
                         let mut evidence = Evidence::default();
@@ -179,6 +196,10 @@ fn production_and_evidence_paths_are_allocation_free_for_every_stage() {
     });
     assert_eq!(count, 0, "production decisions allocated {count} times");
     assert!(denies > 0);
+    assert_eq!(
+        zones_seen, 0b11,
+        "zone lookups must run inside the measured region"
+    );
     // Observe is only reached by the plain path; enforce evidence must reach the rest.
     assert!(
         stages[DecidingStage::Allowlist as usize] > 0
