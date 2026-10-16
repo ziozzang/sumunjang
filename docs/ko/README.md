@@ -22,6 +22,7 @@ TODO는 저장소 루트에 둡니다. Guard는 제로트러스트 백본의 IP/
 | 콘솔 네트워크 API | [네트워크 API](CONSOLE_NETWORK_API.md) | [Network APIs](../CONSOLE_NETWORK_API.md) |
 | 네트워크 존 | [네트워크 존](NETWORK_ZONES.md) | [Zones](../NETWORK_ZONES.md) |
 | 지표 | [지표](METRICS.md) | [Metrics](../METRICS.md) |
+| ASN 번들과 제안 | [ASN](ASN_PROPOSALS.md) | [ASN](../ASN_PROPOSALS.md) |
 | 향후 작업 | [TODO](../../TODO.ko.md) | [TODO](../../TODO.md) |
 
 [Hangang 콘솔 통합](CONSOLE.md)

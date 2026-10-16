@@ -696,3 +696,21 @@ freshness. Hot-path recording is atomic and allocation-free (no_alloc covered);
 DecisionRef now carries its reason code. Core 47 + no_alloc 2 and server 88
 tests and Clippy pass. Open: chart ServiceMonitor/PrometheusRule in the world
 package, OpenMetrics content negotiation.
+
+## ASN prefix pools and reviewed ASN block proposals — 2026-10-17
+
+Original requirements steps 4–6, branch `feat/asn-proposals` (on `feat/metrics`;
+local). Signed `sumunjang.asn-bundle.v1` ASN prefix bundles (dedicated Ed25519
+key, domain-separated envelope, offline signer and import CLI, upload API,
+optional scheduled HTTPS fetch with no default URL, monotonic versions,
+last-good rollback, diff report, audited install). ASN block proposals with
+full-ASN / selected-prefix / /24-/48 aggregate scopes, impact analysis (address
+estimates, tracked evidence and history, current and enforce decision preview,
+allowlist/zone/block collisions, attachable decision-log counts), a configurable
+two-person rule, audited draft→pending→approved/rejected→active→expired/withdrawn
+lifecycle with CAS, and explicit activation into `asn_proposal` blocks only.
+Console package 0.2.0 moves to broker contract v2. Core 47 + no_alloc 2, server
+93 and update 17 tests and Clippy pass. Open: Hangang decision-log facets pulled
+automatically (currently attached by the console), console views, bundle
+publishing pipeline from a licensed provider, LLM-assisted allowlist review
+(step 5 remains manual/reviewed).

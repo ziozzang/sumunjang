@@ -96,3 +96,11 @@ Package 0.1.7 adds `zones` (GET) and `zones` (POST, mutation; upsert or remove)
 and drops the duplicate `audit` GET route (use `audit/query`). The broker's
 32-route limit is now fully used; further routes need a broker contract change
 (ADR 0020 plugin contract v2). See [network zones](NETWORK_ZONES.md).
+
+## Broker contract v2 (package 0.2.0)
+
+Package 0.2.0 declares `api_version: 2` with route patterns
+(`asn/proposals/*` GET/POST) for ASN bundles and proposals and restores the
+`audit` GET route (40 routes + 2 patterns of the broker's 64). It requires a
+Hangang console that supports broker route patterns; older hosts reject it, so
+keep 0.1.7 pinned there. See [ASN bundles and proposals](ASN_PROPOSALS.md).

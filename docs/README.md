@@ -22,6 +22,7 @@ Hopae owns users/principals. Guard decisions do not replace authentication.
 | Console Network APIs | [Network APIs](CONSOLE_NETWORK_API.md) | [네트워크 API](ko/CONSOLE_NETWORK_API.md) |
 | Network zones | [Zones](NETWORK_ZONES.md) | [네트워크 존](ko/NETWORK_ZONES.md) |
 | Metrics | [Metrics](METRICS.md) | [지표](ko/METRICS.md) |
+| ASN bundles and proposals | [ASN](ASN_PROPOSALS.md) | [ASN](ko/ASN_PROPOSALS.md) |
 | Backlog | [TODO](../TODO.md) | [TODO](../TODO.ko.md) |
 
 [Hangang console integration](CONSOLE.md)

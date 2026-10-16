@@ -614,3 +614,17 @@ Clippy가 통과했다. 남은 일: 원격 k3s 교체 검증 재실행, Promethe
 할당이 없으며(no_alloc 확인) DecisionRef가 사유 코드를 가진다. 코어 47·no_alloc 2·서버
 88개 테스트와 Clippy가 통과했다. 남은 일: 월드 패키지 차트의 ServiceMonitor/
 PrometheusRule, OpenMetrics 협상.
+
+## ASN 접두어 풀과 검토된 ASN 차단 제안 — 2026-10-17
+
+원래 요구사항 4–6단계, 브랜치 `feat/asn-proposals`(`feat/metrics` 기반, 로컬). 서명된
+`sumunjang.asn-bundle.v1` ASN 접두어 번들(전용 Ed25519 키, 도메인 분리 엔벨로프,
+오프라인 서명 도구·가져오기 CLI, 업로드 API, 기본 URL 없는 선택적 HTTPS 주기 조회,
+단조 버전, 마지막 정상 롤백, 차이 보고서, 감사되는 설치). 전체 ASN / 선택 접두어 /
+/24·/48 집계 범위의 ASN 차단 제안, 영향 분석(주소 추정, 추적 근거·이력, 현재·집행 판정
+미리보기, 허용 목록/존/차단 충돌, 판정 로그 집계 첨부), 설정 가능한 2인 규칙, CAS가
+있는 감사되는 draft→pending→approved/rejected→active→expired/withdrawn 수명주기,
+`asn_proposal` 차단으로의 명시적 활성화만 허용. 콘솔 패키지 0.2.0은 브로커 계약 v2로
+옮겼다. 코어 47·no_alloc 2·서버 93·업데이트 17개 테스트와 Clippy가 통과했다. 남은 일:
+한강 판정 로그 집계 자동 조회(현재는 콘솔이 첨부), 콘솔 화면, 라이선스 제공자 기반 번들
+게시 파이프라인, LLM 보조 허용 목록 검토(5단계는 수동/검토 유지).
