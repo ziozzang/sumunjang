@@ -640,3 +640,10 @@ no_alloc 2 and server 78 tests and strict Clippy pass. Open: console views,
 history persistence across restarts (deliberately not done), allowlist expiry
 cleanup job, ASN proposal workflow, removal of deprecated unconditional rules
 writes after clients migrate.
+
+Follow-up decisions applied on the same branch: allowlist-only changes keep the
+evidence window; expired allow entries stay visible for 30 days
+(`--allow-expired-retention-days`) and are then pruned as an audited
+`allowlist.expire` change; history stays in memory and reports `in_memory` and
+`retained_since`; the rules revision (lineage + sequence) is persisted so CAS
+survives restarts. Core 43 + no_alloc 2 and server 79 tests and Clippy pass.

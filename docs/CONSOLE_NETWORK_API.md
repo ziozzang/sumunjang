@@ -20,8 +20,11 @@ counts. Response (`sumunjang.history.v1`): `buckets` (`start`, `score`,
 Bounds: retention `--history-hours` (default 6, 1–48); at most 10,000 addresses
 and 262,144 minute buckets in total (≈ 16 MiB worst case); overflow is counted in
 `stats.dropped`, never grown. Only counts are kept — no paths, sources or request
-logs. History is memory-only observation: it survives policy changes (which reset
-the evidence window) and is lost on restart. Events refused because the address
+logs. **History is memory-only**: it survives policy changes (which may reset
+the evidence window) but is lost on restart. Responses carry `in_memory: true`,
+`retained_since` (the earliest time the series can cover: the later of process
+start and the retention edge) and `stats.started_at` (process start), so the UI
+can say "since restart at …" instead of implying no earlier activity. Events refused because the address
 is allowlisted or already denied are not counted, as before.
 
 ## Candidates
@@ -56,7 +59,17 @@ were applied from Lua, so the editor can reload it; a JSON write clears it.
   revision it returns the document, otherwise the RuleSet as before.
 - **Deprecated:** bare-RuleSet `PUT /v1/rules` and Lua writes without
   `expected_revision` remain unconditional (lost-update risk) for existing
-  clients. The rules revision changes on every rules write and on restart.
+  clients.
+
+The rules revision `<lineage>:r<sequence>` changes on every rules write and is
+persisted in the checkpoint, so it survives restarts and CAS does not
+spuriously conflict. The lineage is a random 256-bit ID created with a new
+database; it is kept because it prevents a revision issued by a different
+server or a freshly created database (whose sequence restarts at 1) from
+matching. Restoring an older checkpoint backup rolls the sequence back with the
+rules it describes; clients holding a newer revision get 409 until it is
+exceeded again, so reload after restores. Checkpoints written before this change
+start a new lineage once.
 
 ## Change reasons
 
@@ -91,8 +104,16 @@ write that omits `allow_meta` keeps the metadata of entries that remain, so olde
 editors cannot silently turn a temporary entry into a permanent one. An expired
 entry stops matching on the next lookup (no allocation on the decision path),
 is reported with `expired: true` until removed and is omitted from snapshots;
-a snapshot client may still honour it until its snapshot expires (≤ 30 s). As
-with any policy write, allowlist writes reset the evidence window.
+a snapshot client may still honour it until its snapshot expires (≤ 30 s).
+Expired entries stay listed for `--allow-expired-retention-days` (default 30,
+1–3,650) and are then removed automatically by the five-second maintenance task
+as one audited `allowlist.expire` change (actor `system`); native Kubernetes
+ownership skips it.
+
+Allowlist changes do **not** reset the evidence window: neither the dedicated
+routes nor policy writes whose only differences are `allow`/`allow_meta`.
+Changes to mode, automatic blocking, window, threshold, block TTL or weights
+still restart it.
 
 ## Console package 0.1.6 routes
 

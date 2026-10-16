@@ -567,3 +567,9 @@ CAS(`/v1/rules/document`, `expected_revision`, `current_revision` 포함 409, �
 31개 경로를 선언한다. 코어 42·no_alloc 2·서버 78개 테스트와 Clippy가 통과했다.
 남은 일: 콘솔 화면, 재시작 간 이력 보존(의도적으로 제외), 만료 허용 항목 정리 작업,
 ASN 제안 흐름, 클라이언트 이전 후 무조건 룰 쓰기 제거.
+
+같은 브랜치에 후속 결정을 반영했다. 허용 목록만 바뀌는 변경은 근거 창을 유지하고, 만료
+허용 항목은 30일(`--allow-expired-retention-days`) 동안 보인 뒤 감사되는
+`allowlist.expire` 변경으로 정리한다. 이력은 메모리 전용이며 `in_memory`,
+`retained_since`를 보고한다. 룰 리비전(lineage+순번)은 저장되어 재시작 후에도 CAS가
+유지된다. 코어 43·no_alloc 2·서버 79개 테스트와 Clippy가 통과했다.
