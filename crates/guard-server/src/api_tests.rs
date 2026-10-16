@@ -618,6 +618,7 @@ async fn rich_state(a: &App, mode: &str) {
                         network: network.into(),
                         expires_at,
                         reason: reason.into(),
+                        ..Default::default()
                     },
                     now,
                 )
@@ -1080,4 +1081,543 @@ async fn reason_catalog_is_served_with_identical_language_keys() {
             assert!(en.contains_key(code.as_str().unwrap()), "{code}");
         }
     }
+}
+
+// ----- console Network API gaps -----
+
+async fn events(a: &App, ip: &str, kinds: &[&str]) {
+    let now = crate::now();
+    let events: Vec<Value> = kinds
+        .iter()
+        .map(|k| json!({"ip": ip, "kind": k, "observed_at": now}))
+        .collect();
+    let r = call(
+        a,
+        "POST",
+        "/v1/events",
+        COLLECTOR,
+        Some(json!({"source_id":"t","events":events})),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+}
+
+#[tokio::test]
+async fn signal_history_is_bounded_per_minute_and_queryable() {
+    let a = app();
+    events(
+        &a,
+        "198.51.100.7",
+        &["honeypot", "scanner", "scanner", "auth_failure"],
+    )
+    .await;
+    let r = call(
+        &a,
+        "POST",
+        "/v1/history/query",
+        ADMIN,
+        Some(json!({"ip":"198.51.100.7"})),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let b = &r.body;
+    assert_eq!(b["schema"], "sumunjang.history.v1");
+    assert_eq!(b["bucket_secs"], 60);
+    assert_eq!(b["retention_secs"], 6 * 3600);
+    assert_eq!(b["buckets"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        b["totals"]["signals"],
+        json!({"honeypot":1,"scanner":2,"auth_failure":1,"invalid_request":0})
+    );
+    assert_eq!(b["totals"]["score"], 21);
+    assert_eq!(b["window"]["signal_score"], 21);
+    assert_eq!(b["stats"]["addresses"], 1);
+    let g = call(&a, "GET", "/v1/history?ip=::ffff:198.51.100.7", ADMIN, None).await;
+    assert_eq!(g.body["buckets"], b["buckets"]);
+    let empty = call(&a, "GET", "/v1/history?ip=192.0.2.1", ADMIN, None).await;
+    assert_eq!(empty.body["buckets"], json!([]));
+    assert_eq!(
+        call(&a, "GET", "/v1/history?ip=nope", ADMIN, None)
+            .await
+            .status,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        call(
+            &a,
+            "POST",
+            "/v1/history/query",
+            ADMIN,
+            Some(json!({"ip":"192.0.2.1","since":10,"until":5}))
+        )
+        .await
+        .status,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        call(
+            &a,
+            "POST",
+            "/v1/history/query",
+            COLLECTOR,
+            Some(json!({"ip":"192.0.2.1"}))
+        )
+        .await
+        .status,
+        StatusCode::UNAUTHORIZED
+    );
+    // History survives a policy change that resets the evidence window.
+    assert_eq!(
+        put_document(&a, json!({"threshold": 50})).await.status,
+        StatusCode::OK
+    );
+    let after = call(
+        &a,
+        "POST",
+        "/v1/history/query",
+        ADMIN,
+        Some(json!({"ip":"198.51.100.7"})),
+    )
+    .await;
+    assert_eq!(after.body["totals"]["score"], 21);
+    assert_eq!(after.body["window"]["signal_score"], 0);
+}
+
+#[tokio::test]
+async fn candidates_report_signal_counts_and_country() {
+    let a = app();
+    let paths = crate::geoip::GeoPaths {
+        country: Some(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("fixtures/GeoIP2-Country-Test.mmdb"),
+        ),
+        asn: None,
+    };
+    a.geo.store(std::sync::Arc::new(
+        crate::geoip::GeoCatalog::load(&paths).unwrap(),
+    ));
+    events(
+        &a,
+        "81.2.69.160",
+        &["honeypot", "invalid_request", "invalid_request"],
+    )
+    .await;
+    let c = call(&a, "GET", "/v1/candidates", ADMIN, None).await.body;
+    assert_eq!(
+        c[0]["signals"],
+        json!({"honeypot":1,"scanner":0,"auth_failure":0,"invalid_request":2})
+    );
+    assert_eq!(c[0]["country"], "GB");
+    assert_eq!(c[0]["events"], 3);
+}
+
+#[tokio::test]
+async fn blocks_carry_provenance_and_change_reasons_are_audited() {
+    let a = app();
+    let expires = crate::now() + 600;
+    let now = crate::now();
+    let body = json!({"network":"203.0.113.0/24","expires_at":expires,"reason":"abuse report 42"});
+    let bytes = body.to_string();
+    let (assertion, mac) = actor::sign_for_test(
+        ADMIN.as_bytes(),
+        "POST",
+        "/v1/blocks",
+        bytes.as_bytes(),
+        now,
+    );
+    let r = call_with(
+        &a,
+        "POST",
+        "/v1/blocks",
+        ADMIN,
+        Some(body),
+        &[
+            ("x-hopae-delegation", assertion),
+            ("x-hopae-delegation-mac", mac),
+        ],
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK);
+    // Provenance cannot be supplied by the client.
+    assert_eq!(
+        call(&a, "POST", "/v1/blocks", ADMIN, Some(json!({"network":"192.0.2.0/24","expires_at":expires,"reason":"x","origin":{"source":"auto"}}))).await.status,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    put_document(&a, json!({"mode":"enforce"})).await;
+    events(&a, "198.51.100.9", &["honeypot"]).await;
+    let r = call(
+        &a,
+        "POST",
+        "/v1/candidates/approve",
+        ADMIN,
+        Some(json!({"ip":"198.51.100.9","reason":"reviewed honeypot hit"})),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(r.body["source"], "approved");
+    let blocks = call(&a, "GET", "/v1/blocks", ADMIN, None).await.body;
+    let find = |n: &str| {
+        blocks
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["network"] == n)
+            .unwrap()
+            .clone()
+    };
+    let manual = find("203.0.113.0/24");
+    assert_eq!(
+        (manual["source"].clone(), manual["created_by"].clone()),
+        (json!("manual"), json!("operator"))
+    );
+    assert!(manual["created_at"].as_u64().unwrap() >= now);
+    assert_eq!(find("198.51.100.9/32")["source"], "approved");
+    assert_eq!(find("198.51.100.9/32")["created_by"], "admin-credential");
+    let r = call(
+        &a,
+        "DELETE",
+        "/v1/blocks",
+        ADMIN,
+        Some(json!({"network":"203.0.113.0/24","reason":"false positive"})),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK);
+    let all = entries(&a, "?limit=200").await;
+    let reason =
+        |action: &str| all.iter().find(|e| e["action"] == action).unwrap()["reason"].clone();
+    assert_eq!(reason("blocks.add"), "abuse report 42");
+    assert_eq!(reason("candidates.approve"), "reviewed honeypot hit");
+    assert_eq!(reason("blocks.remove"), "false positive");
+    // Provenance survives restart (checkpoint restore).
+    let body: String =
+        a.db.lock()
+            .unwrap()
+            .query_row("SELECT body FROM checkpoint WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+    let restored = guard_core::Engine::restore(serde_json::from_str(&body).unwrap()).unwrap();
+    assert_eq!(
+        restored.blocks().next().unwrap().origin.source,
+        guard_core::BlockSource::Approved
+    );
+}
+
+#[tokio::test]
+async fn rules_compare_and_set_lua_source_and_legacy_writes() {
+    let a = app();
+    let d = call(&a, "GET", "/v1/rules/document", ADMIN, None)
+        .await
+        .body;
+    assert_eq!(
+        (d["source"].clone(), d["script"].clone()),
+        (json!("json"), Value::Null)
+    );
+    let rules = json!({"version":1,"rules":[{"id":"a","network":"192.0.2.0/24","action":"deny"}]});
+    let ok = call(
+        &a,
+        "PUT",
+        "/v1/rules",
+        ADMIN,
+        Some(json!({"expected_revision":d["revision"],"rules":rules,"reason":"ticket 7"})),
+    )
+    .await;
+    assert_eq!(ok.status, StatusCode::OK, "{}", ok.body);
+    assert_ne!(ok.body["revision"], d["revision"]);
+    let stale = call(
+        &a,
+        "PUT",
+        "/v1/rules",
+        ADMIN,
+        Some(json!({"expected_revision":d["revision"],"rules":{"version":1,"rules":[]}})),
+    )
+    .await;
+    assert_eq!(stale.status, StatusCode::CONFLICT);
+    assert_eq!(stale.body["current_revision"], ok.body["revision"]);
+    assert_eq!(a.inner.lock().unwrap().engine.rules().rules.len(), 1);
+    // Lua with CAS keeps the source for the editor.
+    let script = "return {version=1,rules={{id='l',network='198.51.100.0/24',action='observe'}}}";
+    let lua = call(
+        &a,
+        "PUT",
+        "/v1/rules/lua",
+        ADMIN,
+        Some(json!({"script":script,"expected_revision":ok.body["revision"],"reason":"lua move"})),
+    )
+    .await;
+    assert_eq!(lua.status, StatusCode::OK, "{}", lua.body);
+    assert_eq!(
+        (lua.body["source"].clone(), lua.body["script"].clone()),
+        (json!("lua"), json!(script))
+    );
+    let stale = call(
+        &a,
+        "PUT",
+        "/v1/rules/lua",
+        ADMIN,
+        Some(json!({"script":script,"expected_revision":ok.body["revision"]})),
+    )
+    .await;
+    assert_eq!(stale.status, StatusCode::CONFLICT);
+    assert_eq!(stale.body["current_revision"], lua.body["revision"]);
+    let body: String =
+        a.db.lock()
+            .unwrap()
+            .query_row("SELECT body FROM checkpoint WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+    assert_eq!(
+        guard_core::Engine::restore(serde_json::from_str(&body).unwrap())
+            .unwrap()
+            .rules_script(),
+        Some(script)
+    );
+    // Legacy unconditional writes still work and return the bare RuleSet.
+    let legacy = call(
+        &a,
+        "PUT",
+        "/v1/rules",
+        ADMIN,
+        Some(json!({"version":1,"rules":[]})),
+    )
+    .await;
+    assert_eq!(
+        (legacy.status, legacy.body.clone()),
+        (StatusCode::OK, json!({"version":1,"rules":[]}))
+    );
+    let legacy_lua = call(
+        &a,
+        "PUT",
+        "/v1/rules/lua",
+        ADMIN,
+        Some(json!({"script":script})),
+    )
+    .await;
+    assert_eq!(legacy_lua.body["rules"][0]["id"], "l");
+    assert_eq!(
+        call(&a, "GET", "/v1/rules/document", ADMIN, None)
+            .await
+            .body["script"],
+        script
+    );
+    assert_eq!(
+        call(
+            &a,
+            "PUT",
+            "/v1/rules",
+            ADMIN,
+            Some(json!({"expected_revision":"x","rules":rules,"bogus":1}))
+        )
+        .await
+        .status,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    let all = entries(&a, "?action=rules.*&limit=200").await;
+    assert!(
+        all.iter()
+            .any(|e| e["reason"] == "ticket 7" && e["result"] == "committed")
+    );
+    assert!(all.iter().any(|e| e["reason"] == "lua move"));
+    assert_eq!(all.iter().filter(|e| e["result"] == "refused").count(), 2);
+}
+
+#[tokio::test]
+async fn asn_catalog_lists_prefixes_per_asn_with_cursor() {
+    let a = app();
+    {
+        let mut inner = a.inner.lock().unwrap();
+        let mut prefixes = vec![];
+        for i in 0..5u32 {
+            prefixes.push(guard_core::AsnPrefix {
+                network: format!("198.51.{i}.0/24"),
+                asn: 64500,
+            });
+        }
+        prefixes.push(guard_core::AsnPrefix {
+            network: "2001:db8::/32".into(),
+            asn: 64501,
+        });
+        prefixes.push(guard_core::AsnPrefix {
+            network: "192.0.2.0/24".into(),
+            asn: 13,
+        });
+        inner.engine.set_asn_catalog(prefixes).unwrap();
+    }
+    let r = call(
+        &a,
+        "POST",
+        "/v1/asn/catalog/query",
+        ADMIN,
+        Some(json!({"limit":3})),
+    )
+    .await
+    .body;
+    assert_eq!(
+        (r["total_prefixes"].clone(), r["total_asns"].clone()),
+        (json!(7), json!(3))
+    );
+    assert_eq!(
+        r["entries"],
+        json!([{"asn":13,"prefixes":["192.0.2.0/24"]},{"asn":64500,"prefixes":["198.51.0.0/24","198.51.1.0/24"]}])
+    );
+    let mut cursor = r["next_cursor"].clone();
+    let mut seen = 3;
+    while let Some(c) = cursor.as_str() {
+        let p = call(
+            &a,
+            "POST",
+            "/v1/asn/catalog/query",
+            ADMIN,
+            Some(json!({"limit":3,"cursor":c})),
+        )
+        .await
+        .body;
+        seen += p["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|g| g["prefixes"].as_array().unwrap().len())
+            .sum::<usize>();
+        cursor = p["next_cursor"].clone();
+    }
+    assert_eq!(seen, 7);
+    let one = call(&a, "GET", "/v1/asn/catalog?asn=64500&limit=10", ADMIN, None)
+        .await
+        .body;
+    assert_eq!(one["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(one["entries"][0]["prefixes"].as_array().unwrap().len(), 5);
+    assert!(one["next_cursor"].is_null());
+    assert_eq!(
+        call(&a, "GET", "/v1/asn/catalog?asn=1", ADMIN, None)
+            .await
+            .body["entries"],
+        json!([])
+    );
+    assert_eq!(
+        call(&a, "GET", "/v1/asn/catalog?limit=0", ADMIN, None)
+            .await
+            .status,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        call(&a, "GET", "/v1/asn/catalog?cursor=zz", ADMIN, None)
+            .await
+            .status,
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test]
+async fn allowlist_entries_expire_and_use_compare_and_set() {
+    let a = app();
+    put_document(&a, json!({"mode":"enforce","allow":["192.0.2.0/24"]})).await;
+    let expires = crate::now() + 300;
+    {
+        let now = crate::now();
+        let mut inner = a.inner.lock().unwrap();
+        inner
+            .engine
+            .add_block(
+                guard_core::Block {
+                    network: "198.51.100.0/24".into(),
+                    expires_at: now + 600,
+                    reason: "x".into(),
+                    ..Default::default()
+                },
+                now,
+            )
+            .unwrap();
+        let view = inner.engine.decision_view();
+        a.view.store(std::sync::Arc::new(view));
+    }
+    let list = call(&a, "GET", "/v1/allowlist", ADMIN, None).await.body;
+    assert_eq!(list["entries"][0]["network"], "192.0.2.0/24");
+    let added = call(&a, "POST", "/v1/allowlist", ADMIN, Some(json!({"expected_revision":list["revision"],"network":"198.51.100.7/24","expires_at":expires,"reason":"partner test"}))).await;
+    assert_eq!(added.status, StatusCode::OK, "{}", added.body);
+    let entry = added.body["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["network"] == "198.51.100.0/24")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        (
+            entry["expires_at"].clone(),
+            entry["reason"].clone(),
+            entry["expired"].clone()
+        ),
+        (json!(expires), json!("partner test"), json!(false))
+    );
+    let live = |ip: &str| {
+        a.view
+            .load()
+            .query_ip(ip.parse().unwrap(), crate::now())
+            .action
+    };
+    assert_eq!(live("198.51.100.1"), "allow");
+    assert_eq!(
+        a.view
+            .load()
+            .query_ip("198.51.100.1".parse().unwrap(), expires)
+            .action,
+        "deny"
+    );
+    // Stale revision is refused with the current one.
+    let stale = call(
+        &a,
+        "POST",
+        "/v1/allowlist",
+        ADMIN,
+        Some(json!({"expected_revision":list["revision"],"network":"10.0.0.0/8"})),
+    )
+    .await;
+    assert_eq!(stale.status, StatusCode::CONFLICT);
+    assert_eq!(stale.body["current_revision"], added.body["revision"]);
+    assert_eq!(call(&a, "POST", "/v1/allowlist", ADMIN, Some(json!({"expected_revision":added.body["revision"],"network":"10.0.0.0/8","expires_at":1}))).await.status, StatusCode::BAD_REQUEST);
+    // The policy document exposes allow_meta; a legacy write without it keeps expiries.
+    let d = document(&a).await;
+    assert_eq!(
+        d["policy"]["allow_meta"]["198.51.100.0/24"]["expires_at"],
+        expires
+    );
+    let mut legacy = d["policy"].clone();
+    legacy.as_object_mut().unwrap().remove("allow_meta");
+    legacy["threshold"] = json!(30);
+    assert_eq!(put_document(&a, legacy).await.status, StatusCode::OK);
+    assert_eq!(
+        document(&a).await["policy"]["allow_meta"]["198.51.100.0/24"]["reason"],
+        "partner test"
+    );
+    let snapshot_allow = a.inner.lock().unwrap().engine.snapshot(expires).allow;
+    assert_eq!(snapshot_allow, ["192.0.2.0/24"]);
+    let rev = call(&a, "GET", "/v1/allowlist", ADMIN, None).await.body["revision"].clone();
+    let removed = call(
+        &a,
+        "DELETE",
+        "/v1/allowlist",
+        ADMIN,
+        Some(json!({"expected_revision":rev,"network":"198.51.100.0/24","reason":"partner done"})),
+    )
+    .await;
+    assert_eq!(removed.status, StatusCode::OK);
+    assert_eq!(live("198.51.100.1"), "deny");
+    assert!(document(&a).await["policy"].get("allow_meta").is_none());
+    let rev = removed.body["revision"].clone();
+    assert_eq!(
+        call(
+            &a,
+            "DELETE",
+            "/v1/allowlist",
+            ADMIN,
+            Some(json!({"expected_revision":rev,"network":"198.51.100.0/24"}))
+        )
+        .await
+        .status,
+        StatusCode::BAD_REQUEST
+    );
+    let all = entries(&a, "?action=allowlist.*").await;
+    assert_eq!(all.iter().filter(|e| e["result"] == "committed").count(), 2);
+    assert!(
+        all.iter()
+            .any(|e| e["reason"] == "partner done" && e["target"] == "198.51.100.0/24")
+    );
+    assert!(all.iter().any(|e| e["result"] == "refused"));
 }

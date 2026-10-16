@@ -2,6 +2,7 @@ mod actor;
 #[cfg(test)]
 mod api_tests;
 mod audit;
+mod console_api;
 mod explain;
 mod geoip;
 mod grpc;
@@ -129,6 +130,9 @@ struct Args {
     /// Maximum policy-change audit age in days.
     #[arg(long, default_value_t = audit::DEFAULT_MAX_DAYS, value_parser = clap::value_parser!(u64).range(1..=3650))]
     audit_retention_days: u64,
+    /// Per-address signal history retention in hours (memory only).
+    #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(u64).range(1..=48))]
+    history_hours: u64,
 }
 struct Inner {
     engine: Engine,
@@ -620,7 +624,52 @@ async fn status(HttpState(app): HttpState<App>) -> ApiResult {
 }
 
 async fn candidates(HttpState(app): HttpState<App>) -> ApiResult {
-    operation(app, |e| Ok(serde_json::to_value(e.candidates(now()))?)).await
+    let geo = app.geo.load_full();
+    operation(app, move |e| {
+        let mut list = e.candidates(now());
+        for c in &mut list {
+            if let Ok(ip) = c.ip.parse() {
+                c.country = geo.context(ip).country.map(str::to_owned);
+            }
+        }
+        Ok(serde_json::to_value(list)?)
+    })
+    .await
+}
+/// Optional operator change reason recorded in the audit row.
+fn check_reason(reason: &Option<String>) -> Result<(), (StatusCode, Json<Value>)> {
+    if reason
+        .as_ref()
+        .is_some_and(|r| r.len() > 256 || r.chars().any(char::is_control))
+    {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "reason must be at most 256 bytes without control characters",
+        ));
+    }
+    Ok(())
+}
+/// Map a compare-and-set refusal to 409 with the current revision.
+fn conflict(
+    app: &App,
+    prefix: &str,
+    current: fn(&Engine) -> String,
+) -> impl FnOnce((StatusCode, Json<Value>)) -> (StatusCode, Json<Value>) + use<> {
+    let app = app.clone();
+    let prefix = prefix.to_owned();
+    move |(code, mut body)| {
+        if body.0["error"]
+            .as_str()
+            .is_some_and(|s| s.starts_with(&prefix))
+        {
+            if let Ok(inner) = app.inner.lock() {
+                body.0["current_revision"] = json!(current(&inner.engine));
+            }
+            (StatusCode::CONFLICT, body)
+        } else {
+            (code, body)
+        }
+    }
 }
 async fn policy_get(HttpState(app): HttpState<App>) -> ApiResult {
     operation(app, |e| Ok(serde_json::to_value(e.policy())?)).await
@@ -634,6 +683,8 @@ async fn policy_put(
 ) -> MutationResult {
     let change = Change::new(actor, "policy.replace", Scope::Policy, "policy");
     mutation(app, change, move |e| {
+        let mut policy = policy;
+        e.carry_allow_meta(&mut policy);
         e.set_policy(policy)?;
         Ok(json!({"ok":true}))
     })
@@ -660,30 +711,27 @@ async fn policy_document_put(
     axum::Extension(actor): Admin,
     Json(input): Json<PolicyReplacement>,
 ) -> MutationResult {
-    if input
-        .reason
-        .as_ref()
-        .is_some_and(|r| r.len() > 256 || r.chars().any(char::is_control))
-    {
-        return Err(error(
-            StatusCode::BAD_REQUEST,
-            "reason must be at most 256 bytes without control characters",
-        ));
-    }
+    check_reason(&input.reason)?;
     let mut change = Change::new(actor, "policy.document.replace", Scope::Policy, "policy");
     change.reason = input.reason.clone();
+    let on_conflict = conflict(&app, "policy revision conflict;", Engine::policy_revision);
     mutation(app, change, move |e| {
         anyhow::ensure!(e.policy_revision() == input.expected_revision, "policy revision conflict; draft preserved. Reload policy and reconcile before saving. / 정책 충돌: 초안은 유지됩니다. 저장된 정책을 다시 불러와 변경을 조정하세요.");
-        e.set_policy(input.policy)?;
+        let mut policy = input.policy;
+        e.carry_allow_meta(&mut policy);
+        e.set_policy(policy)?;
         Ok(policy_document(e))
-    }).await.map_err(|(code, body)| {
-        if body.0["error"].as_str().is_some_and(|s| s.starts_with("policy revision conflict;")) {
-            (StatusCode::CONFLICT, body)
-        } else { (code, body) }
-    })
+    }).await.map_err(on_conflict)
 }
 async fn blocks(HttpState(app): HttpState<App>) -> ApiResult {
-    operation(app, |e| Ok(serde_json::to_value(e.snapshot(now()).blocks)?)).await
+    operation(app, |e| {
+        let now = now();
+        e.snapshot(now);
+        Ok(Value::Array(
+            e.blocks().map(console_api::block_json).collect(),
+        ))
+    })
+    .await
 }
 async fn block_add(
     HttpState(app): HttpState<App>,
@@ -691,48 +739,65 @@ async fn block_add(
     Json(block): Json<Block>,
 ) -> MutationResult {
     let target = block.network.clone();
-    mutation(
-        app,
-        Change::new(actor, "blocks.add", Scope::Blocks, target),
-        move |e| {
-            e.add_block(block, now())?;
-            Ok(json!({"ok":true}))
-        },
-    )
+    let mut block = block;
+    let time = now();
+    block.origin = guard_core::BlockOrigin {
+        source: guard_core::BlockSource::Manual,
+        created_at: Some(time),
+        created_by: Some(actor.name.chars().take(64).collect()),
+    };
+    let mut change = Change::new(actor, "blocks.add", Scope::Blocks, target);
+    change.reason = Some(block.reason.clone()).filter(|r| !r.is_empty());
+    mutation(app, change, move |e| {
+        e.add_block(block, time)?;
+        Ok(json!({"ok":true}))
+    })
     .await
 }
 #[derive(Deserialize)]
 struct Network {
     network: String,
+    /// Optional change reason (block removal), recorded in the audit row.
+    #[serde(default)]
+    reason: Option<String>,
 }
 async fn block_delete(
     HttpState(app): HttpState<App>,
     axum::Extension(actor): Admin,
     Json(input): Json<Network>,
 ) -> MutationResult {
+    check_reason(&input.reason)?;
     let target = input.network.clone();
-    mutation(
-        app,
-        Change::new(actor, "blocks.remove", Scope::Blocks, target),
-        move |e| Ok(json!({"removed":e.remove_block(&input.network)?})),
-    )
+    let mut change = Change::new(actor, "blocks.remove", Scope::Blocks, target);
+    change.reason = input.reason.clone();
+    mutation(app, change, move |e| {
+        Ok(json!({"removed":e.remove_block(&input.network)?}))
+    })
     .await
 }
 #[derive(Deserialize)]
 struct Approval {
     ip: String,
+    #[serde(default)]
+    reason: Option<String>,
 }
 async fn approve(
     HttpState(app): HttpState<App>,
     axum::Extension(actor): Admin,
     Json(input): Json<Approval>,
 ) -> MutationResult {
+    check_reason(&input.reason)?;
     let target = input.ip.clone();
-    mutation(
-        app,
-        Change::new(actor, "candidates.approve", Scope::Blocks, target),
-        move |e| Ok(serde_json::to_value(e.approve(&input.ip, now())?)?),
-    )
+    let by: String = actor.name.chars().take(64).collect();
+    let mut change = Change::new(actor, "candidates.approve", Scope::Blocks, target);
+    change.reason = input.reason.clone();
+    mutation(app, change, move |e| {
+        Ok(console_api::block_json(&e.approve_as(
+            &input.ip,
+            now(),
+            Some(&by),
+        )?))
+    })
     .await
 }
 #[derive(Deserialize)]
@@ -863,25 +928,65 @@ async fn refuse_unapplied(app: &App, change: Change, message: String) {
 async fn rules_get(HttpState(app): HttpState<App>) -> ApiResult {
     operation(app, |e| Ok(serde_json::to_value(e.rules())?)).await
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RulesReplacement {
+    expected_revision: String,
+    rules: guard_core::RuleSet,
+    #[serde(default)]
+    reason: Option<String>,
+}
+const RULES_CONFLICT: &str = "rules revision conflict;";
+fn rules_document(e: &Engine) -> Value {
+    json!({"revision": e.rules_revision(), "rules": e.rules(),
+           "source": if e.rules_script().is_some() {"lua"} else {"json"},
+           "script": e.rules_script()})
+}
+/// `PUT /v1/rules`: `{expected_revision, rules, reason?}` (compare-and-set) or a
+/// bare RuleSet (deprecated unconditional write, kept for compatibility).
 async fn rules_put(
     HttpState(app): HttpState<App>,
     axum::Extension(actor): Admin,
-    Json(rules): Json<guard_core::RuleSet>,
+    Json(body): Json<Value>,
 ) -> MutationResult {
-    mutation(
-        app,
-        Change::new(actor, "rules.replace", Scope::Rules, "rules"),
-        move |e| {
-            e.set_rules(rules)?;
-            Ok(serde_json::to_value(e.rules())?)
-        },
-    )
+    let mut change = Change::new(actor, "rules.replace", Scope::Rules, "rules");
+    if body.get("expected_revision").is_some() {
+        let input: RulesReplacement =
+            serde_json::from_value(body).map_err(|e| error(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+        check_reason(&input.reason)?;
+        change.reason = input.reason.clone();
+        let on_conflict = conflict(&app, RULES_CONFLICT, Engine::rules_revision);
+        return mutation(app, change, move |e| {
+            anyhow::ensure!(
+                e.rules_revision() == input.expected_revision,
+                "rules revision conflict; draft preserved. Reload rules and reconcile before saving."
+            );
+            e.set_rules(input.rules)?;
+            Ok(rules_document(e))
+        })
+        .await
+        .map_err(on_conflict);
+    }
+    let rules: guard_core::RuleSet =
+        serde_json::from_value(body).map_err(|e| error(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    mutation(app, change, move |e| {
+        e.set_rules(rules)?;
+        Ok(serde_json::to_value(e.rules())?)
+    })
     .await
+}
+async fn rules_document_get(HttpState(app): HttpState<App>) -> ApiResult {
+    operation(app, |e| Ok(rules_document(e))).await
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LuaRequest {
     script: String,
+    /// Optional compare-and-set against `GET /v1/rules/document` revision.
+    #[serde(default)]
+    expected_revision: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
 }
 async fn compile_script(
     app: &App,
@@ -905,7 +1010,11 @@ async fn rules_lua(
     axum::Extension(actor): Admin,
     Json(input): Json<LuaRequest>,
 ) -> MutationResult {
-    let change = Change::new(actor, "rules.lua.replace", Scope::Rules, "rules");
+    check_reason(&input.reason)?;
+    let mut change = Change::new(actor, "rules.lua.replace", Scope::Rules, "rules");
+    change.reason = input.reason.clone();
+    let script = input.script.clone();
+    let expected = input.expected_revision.clone();
     let rules = match compile_script(&app, input.script).await {
         Ok(rules) => rules,
         Err(refusal) => {
@@ -917,11 +1026,23 @@ async fn rules_lua(
             return Err(refusal);
         }
     };
+    let on_conflict = conflict(&app, RULES_CONFLICT, Engine::rules_revision);
     mutation(app, change, move |e| {
-        e.set_rules(rules)?;
-        Ok(serde_json::to_value(e.rules())?)
+        if let Some(expected) = &expected {
+            anyhow::ensure!(
+                &e.rules_revision() == expected,
+                "rules revision conflict; draft preserved. Reload rules and reconcile before saving."
+            );
+        }
+        e.set_rules_from_script(rules, script)?;
+        Ok(if expected.is_some() {
+            rules_document(e)
+        } else {
+            serde_json::to_value(e.rules())?
+        })
     })
     .await
+    .map_err(on_conflict)
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1019,6 +1140,17 @@ fn router(app: App) -> Router {
         )
         .route("/v1/explain/batch", post(explain::batch))
         .route("/v1/reasons", get(explain::reasons))
+        .route("/v1/rules/document", get(rules_document_get))
+        .route("/v1/history", get(console_api::history_get))
+        .route("/v1/history/query", post(console_api::history_post))
+        .route("/v1/asn/catalog", get(console_api::asn_get))
+        .route("/v1/asn/catalog/query", post(console_api::asn_post))
+        .route(
+            "/v1/allowlist",
+            get(console_api::allowlist_get)
+                .post(console_api::allowlist_add)
+                .delete(console_api::allowlist_remove),
+        )
         .layer(DefaultBodyLimit::max(4 * 1024 * 1024))
         .layer(axum::middleware::from_fn(
             move |request: axum::extract::Request, next: axum::middleware::Next| {
@@ -1082,6 +1214,8 @@ fn router(app: App) -> Router {
                                         | "/v1/audit/query"
                                         | "/v1/explain"
                                         | "/v1/explain/batch"
+                                        | "/v1/history/query"
+                                        | "/v1/asn/catalog/query"
                                 )))
                     {
                         if let Some(action) = action_for(request.method(), path)
@@ -1191,12 +1325,15 @@ fn action_for(method: &axum::http::Method, path: &str) -> Option<&'static str> {
         (&Method::PUT, "/v1/rules/lua") => "rules.lua.replace",
         (&Method::POST, "/v1/geoip/reload") => "geoip.reload",
         (&Method::POST, "/v1/update/check") => "update.check",
+        (&Method::POST, "/v1/allowlist") => "allowlist.add",
+        (&Method::DELETE, "/v1/allowlist") => "allowlist.remove",
         _ => return None,
     })
 }
 fn action_target(action: &str) -> &'static str {
     match action.split('.').next() {
         Some("policy") => "policy",
+        Some("allowlist") => "allowlist",
         Some("blocks") | Some("candidates") => "blocks",
         Some("rules") => "rules",
         Some("geoip") => "geoip",
@@ -1634,6 +1771,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
         max_rows: args.audit_max_rows,
         max_days: args.audit_retention_days,
     };
+    engine.set_history(Arc::new(Mutex::new(
+        guard_core::history::SignalHistory::new(args.history_hours * 3600),
+    )));
     let startup_before = Some(engine.clone());
     if fresh_database && let Some(path) = args.bootstrap_policy {
         engine.set_policy(serde_json::from_slice(&read_bounded(&path, 1024 * 1024)?)?)?;

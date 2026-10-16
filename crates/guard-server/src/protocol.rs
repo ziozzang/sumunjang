@@ -384,6 +384,7 @@ mod tests {
                     network: "192.0.2.0/24".into(),
                     expires_at: now() + 300,
                     reason: "test".into(),
+                    ..Default::default()
                 },
                 now(),
             )

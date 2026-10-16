@@ -130,6 +130,12 @@ fn decode(bytes: &[u8], config: &Config) -> Result<(Engine, String)> {
             networks.insert(guard_core::canonical_network(&block.network)?),
             "duplicate source block"
         );
+        let mut block = block;
+        block.origin = guard_core::BlockOrigin {
+            source: guard_core::BlockSource::Kubernetes,
+            created_at: None,
+            created_by: None,
+        };
         engine.add_block(block, crate::now())?;
     }
     Ok((engine, version))
@@ -331,6 +337,7 @@ fn install(
         .map_err(|_| anyhow::anyhow!("source state unavailable"))?;
     let mut engine = engine;
     engine.advance_revision_past(inner.engine.revision())?;
+    engine.set_history(inner.engine.history());
     let p = Arc::new(Publication {
         view: Arc::new(engine.decision_view()),
         deadline,
