@@ -233,7 +233,8 @@ impl<T> PrefixTrie<T> {
         ip: IpAddr,
         accept: impl FnMut(&'s T) -> bool,
     ) -> Option<&'s T> {
-        self.longest_prefix_where(ip, accept).map(|(_, value)| value)
+        self.longest_prefix_where(ip, accept)
+            .map(|(_, value)| value)
     }
     /// Like [`Self::longest_where`], also returning the accepted prefix length in
     /// the address family of `ip` (IPv4 and IPv4-mapped IPv6 report 0..=32).

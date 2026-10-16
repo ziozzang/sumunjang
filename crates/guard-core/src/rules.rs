@@ -82,7 +82,10 @@ impl RuleSet {
                 errors.push(E::new(at("id"), "duplicate rule ID"));
             }
             if r.description.len() > 256 {
-                errors.push(E::new(at("description"), "rule description exceeds 256 bytes"));
+                errors.push(E::new(
+                    at("description"),
+                    "rule description exceeds 256 bytes",
+                ));
             }
             if r.score > 1_000_000 {
                 errors.push(E::new(at("score"), "rule score exceeds 1000000"));

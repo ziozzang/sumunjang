@@ -2,8 +2,8 @@ pub mod reasons;
 pub mod rules;
 pub mod trace;
 use rules::CompiledRules;
-use trace::{AsnSource, DecidingStage, NoTrace, TraceEvent, Tracer};
 pub use rules::{GeoContext, Rule, RuleAction, RuleSet, Suspicion};
+use trace::{AsnSource, DecidingStage, NoTrace, TraceEvent, Tracer};
 pub mod network_policy;
 pub mod pod_peers;
 pub mod prefix;
@@ -177,9 +177,10 @@ impl Policy {
                 break;
             }
             match canonical_network(n) {
-                Ok(n) if !seen.insert(n) => {
-                    errors.push(FieldError::new(format!("/allow/{i}"), "duplicate allow rule"))
-                }
+                Ok(n) if !seen.insert(n) => errors.push(FieldError::new(
+                    format!("/allow/{i}"),
+                    "duplicate allow rule",
+                )),
                 Ok(_) => {}
                 Err(e) => errors.push(FieldError::new(format!("/allow/{i}"), e.to_string())),
             }
