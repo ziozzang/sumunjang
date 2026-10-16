@@ -106,12 +106,17 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
                 let request: &[u8; REQUEST_LEN] =
                     requests[offset..offset + REQUEST_LEN].try_into()?;
                 let (correlation, ip) = decode(request)?;
+                let started = std::time::Instant::now();
                 let mut decision = app.query(&view, ip, time);
+                use guard_core::metrics::{METRICS, Transport, Unavailable};
                 if let Some(remaining) = app.source_remaining(&view) {
                     decision.ttl_ms = decision.ttl_ms.min(remaining);
                 } else {
+                    METRICS.unavailable(Transport::Hgd1, Unavailable::Source);
                     anyhow::bail!("native policy source unavailable");
                 }
+                METRICS.decision(Transport::Hgd1, decision.mode, decision.code);
+                METRICS.latency(Transport::Hgd1, started.elapsed());
                 let frame = &mut responses[offset..offset + REQUEST_LEN];
                 frame.fill(0);
                 frame[0] = 1;

@@ -49,6 +49,7 @@ impl Network for Service {
         &self,
         request: Request<NetworkRequest>,
     ) -> Result<Response<NetworkReply>, Status> {
+        let started = std::time::Instant::now();
         caller(&self.app, request.metadata())?;
         let _permit = self
             .requests
@@ -66,6 +67,7 @@ impl Network for Service {
             _ => return Err(Status::invalid_argument("invalid address size")),
         };
         let view = self.app.view.load_full();
+        let _latency = Latency(started);
         if input.include_evidence {
             return Ok(Response::new(self.reply_with_evidence(
                 input.request_id,
@@ -86,6 +88,14 @@ impl Network for Service {
             geo.as_ref(),
             decision,
         )))
+    }
+}
+/// Records gRPC decision latency when the handler returns.
+struct Latency(std::time::Instant);
+impl Drop for Latency {
+    fn drop(&mut self) {
+        guard_core::metrics::METRICS
+            .latency(guard_core::metrics::Transport::Grpc, self.0.elapsed());
     }
 }
 fn stage_number(stage: guard_core::trace::DecidingStage) -> i32 {
@@ -179,6 +189,18 @@ impl Service {
             && decision.revision >= minimum_revision
             && Arc::ptr_eq(view, &self.app.view.load_full())
             && geo.is_none_or(|captured| Arc::ptr_eq(captured, &self.app.geo.load_full()));
+        {
+            use guard_core::metrics::{METRICS, Transport, Unavailable};
+            if available {
+                METRICS.decision(Transport::Grpc, decision.mode, decision.code);
+            } else if source_remaining.is_none() {
+                METRICS.unavailable(Transport::Grpc, Unavailable::Source);
+            } else if decision.revision < minimum_revision {
+                METRICS.unavailable(Transport::Grpc, Unavailable::RevisionFloor);
+            } else {
+                METRICS.unavailable(Transport::Grpc, Unavailable::OwnerReplaced);
+            }
+        }
         NetworkReply {
             request_id,
             revision: decision.revision,

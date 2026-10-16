@@ -1967,3 +1967,84 @@ async fn readiness_reflects_checkpoint_health_and_status_reports_tls() {
     crate::checkpoint(a.clone()).await.unwrap();
     assert_eq!(probe(&a).await, StatusCode::OK);
 }
+
+#[tokio::test]
+async fn metrics_endpoint_is_authorized_bounded_and_counts_decisions() {
+    async fn scrape(a: &App, token: Option<&str>) -> (StatusCode, String, Option<String>) {
+        let mut b = Request::builder().uri("/metrics");
+        if let Some(t) = token {
+            b = b.header("authorization", format!("Bearer {t}"));
+        }
+        let r = crate::router(a.clone())
+            .oneshot(b.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = r.status();
+        let ct = r
+            .headers()
+            .get("content-type")
+            .map(|v| v.to_str().unwrap().to_owned());
+        let bytes = axum::body::to_bytes(r.into_body(), 1 << 22).await.unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap(), ct)
+    }
+    let a = app();
+    for token in [None, Some(COLLECTOR), Some("wrong-token-0123456789")] {
+        assert_eq!(scrape(&a, token).await.0, StatusCode::UNAUTHORIZED);
+    }
+    let series = |text: &str, name: &str| -> u64 {
+        text.lines()
+            .find(|l| l.starts_with(name))
+            .and_then(|l| l.rsplit(' ').next())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    };
+    let key = "sumunjang_decisions_total{transport=\"http\",mode=\"enforce\",outcome=\"deny\",reason=\"sumunjang.deny.rule\"}";
+    let before = series(&scrape(&a, Some("metrics-test-token")).await.1, key);
+    put_document(&a, json!({"mode":"enforce"})).await;
+    call(
+        &a,
+        "PUT",
+        "/v1/rules",
+        ADMIN,
+        Some(json!({"version":1,"rules":[{"id":"r","network":"192.0.2.0/24","action":"deny"}]})),
+    )
+    .await;
+    upsert_zone(&a, json!({"id":"corp","prefixes":["10.0.0.0/8"]})).await;
+    for _ in 0..3 {
+        call(
+            &a,
+            "POST",
+            "/v1/decision",
+            COLLECTOR,
+            Some(json!({"source_id":"t","ip":"192.0.2.77"})),
+        )
+        .await;
+    }
+    let (status, text, ct) = scrape(&a, Some("metrics-test-token")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        ct.as_deref(),
+        Some("text/plain; version=0.0.4; charset=utf-8")
+    );
+    assert!(series(&text, key) >= before + 3, "{text}");
+    for needle in [
+        "sumunjang_decision_duration_seconds_bucket{transport=\"http\",le=\"+Inf\"}",
+        "sumunjang_rules 1",
+        "sumunjang_zones 1",
+        "sumunjang_policy_enforce 1",
+        "sumunjang_tls_enabled 0",
+        "sumunjang_kubernetes_authority_enabled 0",
+        "sumunjang_allowlist_entries{state=\"active\"} 0",
+        "sumunjang_history_buckets",
+        "sumunjang_admin_changes_total{result=\"committed\"}",
+        "sumunjang_checkpoints_total{result=\"failure\"}",
+        "sumunjang_ready 1",
+    ] {
+        assert!(text.contains(needle), "missing {needle}");
+    }
+    // No addresses, rule ids or zone names as label values.
+    for leak in ["192.0.2", "10.0.0.0", "corp", "\"r\""] {
+        assert!(!text.contains(leak), "leaked {leak}");
+    }
+    assert_eq!(scrape(&a, Some(ADMIN)).await.0, StatusCode::OK);
+}

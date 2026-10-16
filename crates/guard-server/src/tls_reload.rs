@@ -81,6 +81,55 @@ fn load(files: &TlsFiles) -> Result<Material> {
 /// Same policy as `hangang_runtime::tls_config` (mandatory client certificates
 /// from the explicit CA, safe protocol versions, no early data), built from one
 /// consistent read. Returns the configuration and the leaf SHA-256 fingerprint.
+/// `notAfter` of a DER X.509 certificate as Unix seconds (minimal DER walk).
+pub(crate) fn not_after(der: &[u8]) -> Option<u64> {
+    fn tlv(b: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+        let (&tag, rest) = b.split_first()?;
+        let (&first, rest) = rest.split_first()?;
+        let (len, rest) = if first < 0x80 {
+            (first as usize, rest)
+        } else {
+            let n = (first & 0x7f) as usize;
+            if n == 0 || n > 4 || rest.len() < n {
+                return None;
+            }
+            let len = rest[..n].iter().fold(0usize, |a, b| (a << 8) | *b as usize);
+            (len, &rest[n..])
+        };
+        (rest.len() >= len).then(|| (tag, &rest[..len], &rest[len..]))
+    }
+    let (_, cert, _) = tlv(der)?;
+    let (_, tbs, _) = tlv(cert)?;
+    // TBSCertificate: [0] version (optional), serial, signature, issuer, validity.
+    let (tag, _, after_first) = tlv(tbs)?;
+    let mut items = if tag == 0xa0 { after_first } else { tbs };
+    for _ in 0..3 {
+        items = tlv(items)?.2;
+    }
+    let (_, validity, _) = tlv(items)?;
+    let (_, _not_before, after) = tlv(validity)?;
+    let (tag, time, _) = tlv(after)?;
+    let s = std::str::from_utf8(time).ok()?.strip_suffix('Z')?;
+    let (year, rest) = match tag {
+        0x17 if s.len() == 12 => {
+            let y: i64 = s[..2].parse().ok()?;
+            (if y >= 50 { 1900 + y } else { 2000 + y }, &s[2..])
+        }
+        0x18 if s.len() == 14 => (s[..4].parse().ok()?, &s[4..]),
+        _ => return None,
+    };
+    let n = |i: usize| rest.get(i..i + 2)?.parse::<i64>().ok();
+    let (month, day, hour, minute, second) = (n(0)?, n(2)?, n(4)?, n(6)?, n(8)?);
+    // Days from civil (Howard Hinnant).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86_400 + hour * 3600 + minute * 60 + second).ok()
+}
 fn build(m: &Material, alpn: &[u8]) -> Result<(Arc<ServerConfig>, String)> {
     let certs =
         rustls_pemfile::certs(&mut m.cert.as_slice()).collect::<std::io::Result<Vec<_>>>()?;
@@ -106,8 +155,13 @@ fn build(m: &Material, alpn: &[u8]) -> Result<(Arc<ServerConfig>, String)> {
     Ok((Arc::new(config), fingerprint))
 }
 
+fn leaf_not_after(m: &Material) -> Option<u64> {
+    let leaf = rustls_pemfile::certs(&mut m.cert.as_slice()).next()?.ok()?;
+    not_after(leaf.as_ref())
+}
 #[derive(Default)]
 struct State {
+    not_after: Option<u64>,
     digest: String,
     fingerprint: String,
     loaded_at: u64,
@@ -147,6 +201,7 @@ impl TlsReloader {
             hgd1: AcceptorSource::fixed(hgd1),
             grpc: AcceptorSource::fixed(grpc),
             state: Mutex::new(State {
+                not_after: leaf_not_after(&m),
                 digest: m.digest,
                 fingerprint,
                 loaded_at: crate::now(),
@@ -182,7 +237,7 @@ impl TlsReloader {
                 let (management, fingerprint) = build(&m, MANAGEMENT_ALPN)?;
                 let (hgd1, _) = build(&m, HGD1_ALPN)?;
                 let (grpc, _) = build(&m, GRPC_ALPN)?;
-                Ok::<_, anyhow::Error>((management, hgd1, grpc, fingerprint))
+                Ok::<_, anyhow::Error>((management, hgd1, grpc, fingerprint, leaf_not_after(&m)))
             })();
             Some((m.digest, result))
         });
@@ -198,7 +253,8 @@ impl TlsReloader {
         };
         match built {
             Ok(None) => Poll::Unchanged,
-            Ok(Some((digest, Ok((management, hgd1, grpc, fingerprint))))) => {
+            Ok(Some((digest, Ok((management, hgd1, grpc, fingerprint, not_after))))) => {
+                state.not_after = not_after;
                 self.management.0.store(management);
                 self.hgd1.0.store(hgd1);
                 self.grpc.0.store(grpc);
@@ -222,6 +278,12 @@ impl TlsReloader {
             }
         }
     }
+    /// (reloads, failures, consecutive failures, leaf notAfter) for metrics.
+    pub fn counters(&self) -> (u64, u64, u64, Option<u64>) {
+        self.state.lock().map_or((0, 0, 0, None), |s| {
+            (s.reloads, s.failures, s.consecutive_failures, s.not_after)
+        })
+    }
     pub fn status(&self) -> Value {
         let Ok(s) = self.state.lock() else {
             return json!({"enabled": true, "error": "state unavailable"});
@@ -229,6 +291,7 @@ impl TlsReloader {
         json!({
             "enabled": true,
             "leaf_sha256": s.fingerprint,
+            "leaf_not_after": s.not_after,
             "loaded_at": s.loaded_at,
             "reloads_total": s.reloads,
             "reload_failures_total": s.failures,
@@ -573,5 +636,27 @@ pub(crate) mod tests {
         tx.send(true).unwrap();
         hgd1_task.await.unwrap().unwrap();
         grpc_task.await.unwrap().unwrap();
+    }
+    #[test]
+    fn leaf_expiry_is_parsed_from_der() {
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(vec!["localhost".into()]).unwrap();
+        params.not_after = rcgen::date_time_ymd(2031, 7, 9);
+        let cert = params.self_signed(&key).unwrap();
+        // 2031-07-09T00:00:00Z
+        assert_eq!(not_after(cert.der()), Some(1_941_321_600));
+        let mut params = CertificateParams::new(vec!["localhost".into()]).unwrap();
+        params.not_after = rcgen::date_time_ymd(2061, 1, 1);
+        let cert = params.self_signed(&key).unwrap();
+        assert_eq!(not_after(cert.der()), Some(2_871_763_200));
+        assert_eq!(not_after(b"garbage"), None);
+        let pki = Pki::new();
+        assert!(
+            TlsReloader::new(pki.files())
+                .unwrap()
+                .counters()
+                .3
+                .is_some()
+        );
     }
 }

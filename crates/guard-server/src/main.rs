@@ -9,6 +9,7 @@ mod grpc;
 mod kubernetes;
 mod kubernetes_authority;
 mod lua_rules;
+mod metrics_http;
 mod protocol;
 mod readiness;
 #[cfg(target_os = "linux")]
@@ -169,6 +170,21 @@ struct App {
     tls: Option<Arc<tls_reload::TlsReloader>>,
     /// Set while the most recent periodic checkpoint failed (readiness).
     checkpoint_failed: Arc<std::sync::atomic::AtomicBool>,
+    /// Optional read-only credential for `GET /metrics`.
+    metrics_token: Option<Arc<String>>,
+}
+/// Optional metrics credential: 16..4096 bytes, distinct from the others.
+fn metrics_token(collector: &str, admin: &str) -> anyhow::Result<Option<String>> {
+    match std::env::var("HANGANG_GUARD_METRICS_TOKEN") {
+        Err(_) => Ok(None),
+        Ok(t) => {
+            anyhow::ensure!(
+                (16..=4096).contains(&t.len()) && t != collector && t != admin,
+                "metrics token must be distinct and 16..4096 bytes"
+            );
+            Ok(Some(t))
+        }
+    }
 }
 impl App {
     /// Readiness: a fresh native source (when configured) and a healthy
@@ -360,7 +376,14 @@ fn scope_summary(scope: Scope, before: &Engine, after: &Engine) -> String {
     }
 }
 /// Best-effort refusal record; a failure cannot change an already refused outcome.
+fn count(counter: &std::sync::atomic::AtomicU64) {
+    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
 fn record_refusal(app: &App, db: &mut Connection, mut record: audit::Record, message: String) {
+    count(&guard_core::metrics::METRICS.admin_changes[1]);
+    if record.action == "rules.replace" && !message.starts_with("rules revision conflict") {
+        count(&guard_core::metrics::METRICS.rules_compile_failures[1]);
+    }
     record.result = audit::Outcome::Refused;
     record.summary = format!("refused: {message}");
     record.error = Some(message);
@@ -434,6 +457,7 @@ where
                 // Same ID: if COMMIT did persist the committed row this insert
                 // fails on uniqueness; otherwise the uncertain row records it.
                 PersistError::Commit(_) => {
+                    count(&guard_core::metrics::METRICS.admin_changes[2]);
                     let _ = audit::insert_alone(&mut db, app.audit, &failed);
                 }
                 PersistError::Before(e) => {
@@ -451,6 +475,7 @@ where
             ));
         }
         inner.engine = next;
+        count(&guard_core::metrics::METRICS.admin_changes[0]);
         if inner.engine.revision() != app.view.load().revision {
             app.view.store(Arc::new(inner.engine.decision_view()));
         }
@@ -525,6 +550,9 @@ async fn events(HttpState(app): HttpState<App>, Json(batch): Json<EventBatch>) -
             .iter()
             .any(|e| e.observed_at.abs_diff(received) > 300)
     {
+        guard_core::metrics::METRICS
+            .evidence_batches_rejected
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Err(error(
             StatusCode::BAD_REQUEST,
             "invalid event batch or timestamp",
@@ -563,6 +591,13 @@ struct DecisionRequest {
     #[serde(default)]
     evidence: bool,
 }
+struct HttpLatency(std::time::Instant);
+impl Drop for HttpLatency {
+    fn drop(&mut self) {
+        guard_core::metrics::METRICS
+            .latency(guard_core::metrics::Transport::Http, self.0.elapsed());
+    }
+}
 /// Attach decision evidence computed on the currently published view.
 fn decision_with_evidence(app: &App, decision: Value, ip: std::net::IpAddr, time: u64) -> Response {
     let mut decision = decision;
@@ -580,8 +615,16 @@ async fn decision(
         return Err(error(StatusCode::BAD_REQUEST, "invalid source ID"));
     }
     let time = now();
+    let started = std::time::Instant::now();
+    let _latency = HttpLatency(started);
     let view = app.view.load();
     let mut before = app.query(&view, input.ip, time);
+    {
+        use guard_core::metrics::{METRICS, Transport};
+        // The ingest path below may add an automatic block; it is recorded
+        // with the pre-ingest outcome (the reply then reflects the new block).
+        METRICS.decision(Transport::Http, before.mode, before.code);
+    }
     if app.native_source.is_some() {
         let remaining = app
             .source_remaining(&view)
@@ -1039,7 +1082,10 @@ async fn compile_script(
     })
     .await
     .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "rule worker failed"))?
-    .map_err(|e| error(StatusCode::BAD_REQUEST, e))
+    .map_err(|e| {
+        count(&guard_core::metrics::METRICS.rules_compile_failures[0]);
+        error(StatusCode::BAD_REQUEST, e)
+    })
 }
 async fn rules_lua(
     HttpState(app): HttpState<App>,
@@ -1092,9 +1138,10 @@ async fn rules_validate(
 ) -> ApiResult {
     let rules = match (input.rules, input.script) {
         (Some(mut rules), None) => {
-            rules
-                .validate()
-                .map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
+            rules.validate().map_err(|e| {
+                count(&guard_core::metrics::METRICS.rules_compile_failures[1]);
+                error(StatusCode::BAD_REQUEST, e)
+            })?;
             rules
         }
         (None, Some(script)) => compile_script(&app, script).await?,
@@ -1129,6 +1176,7 @@ fn router(app: App) -> Router {
         .route("/", get(|| async { Html(include_str!("dashboard.html")) }))
         .route("/healthz", get(|| async { Json(json!({"status":"ok"})) }))
         .route("/readyz", get(ready))
+        .route("/metrics", get(metrics_http::metrics))
         .route("/v1/kubernetes/authority", get(native_source_status))
         .route(
             "/v1/decision",
@@ -1227,6 +1275,16 @@ fn router(app: App) -> Router {
                     {
                         return e.into_response();
                     }
+                    // Read-only metrics credential, or the admin credential.
+                    if path == "/metrics"
+                        && credentials
+                            .metrics_token
+                            .as_deref()
+                            .is_none_or(|t| authorize(request.headers(), t).is_err())
+                        && let Err(e) = authorize(request.headers(), &credentials.admin)
+                    {
+                        return e.into_response();
+                    }
                     let mut request = request;
                     if admin_path {
                         request = match admin_actor(&credentials, request).await {
@@ -1239,6 +1297,10 @@ fn router(app: App) -> Router {
                             .source_remaining(&credentials.view.load())
                             .is_none()
                     {
+                        guard_core::metrics::METRICS.unavailable(
+                            guard_core::metrics::Transport::Http,
+                            guard_core::metrics::Unavailable::Source,
+                        );
                         return error(StatusCode::SERVICE_UNAVAILABLE, "native source unavailable")
                             .into_response();
                     }
@@ -1572,6 +1634,7 @@ fn check_configuration(args: &Args) -> anyhow::Result<()> {
             && collector != admin,
         "tokens must be distinct and 16..4096 bytes"
     );
+    metrics_token(&collector, &admin)?;
     let mut fresh_database = true;
     let mut engine = if args.database.exists() {
         let db = Connection::open_with_flags(
@@ -1807,6 +1870,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
             && collector != admin,
         "tokens must be distinct and 16..4096 bytes"
     );
+    let metrics_token = metrics_token(&collector, &admin)?.map(Arc::new);
     let mut db = open_database(&args.database)?;
     let saved = db.query_row("SELECT body FROM checkpoint WHERE id=1", [], |r| {
         r.get::<_, String>(0)
@@ -1879,6 +1943,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         allow_expired_keep: args.allow_expired_retention_days * 86_400,
         tls: tls_reloader.clone(),
         checkpoint_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        metrics_token,
         native_source,
         network_source: Arc::new(arc_swap::ArcSwapOption::empty()),
         network_source_phase: Arc::new(std::sync::atomic::AtomicU8::new(0)),
@@ -2076,6 +2141,14 @@ async fn checkpoint(app: App) -> anyhow::Result<()> {
     let flag = app.checkpoint_failed.clone();
     let result = checkpoint_once(app).await;
     flag.store(result.is_err(), std::sync::atomic::Ordering::Release);
+    let m = &guard_core::metrics::METRICS;
+    if result.is_ok() {
+        count(&m.checkpoint_success);
+        m.checkpoint_last_success
+            .store(now(), std::sync::atomic::Ordering::Relaxed);
+    } else {
+        count(&m.checkpoint_failure);
+    }
     result
 }
 async fn checkpoint_once(app: App) -> anyhow::Result<()> {
@@ -2129,6 +2202,7 @@ mod tests {
             allow_expired_keep: 30 * 86_400,
             tls: None,
             checkpoint_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            metrics_token: Some(Arc::new("metrics-test-token".into())),
             native_source: None,
             network_source: Arc::new(arc_swap::ArcSwapOption::empty()),
             network_source_phase: Arc::new(std::sync::atomic::AtomicU8::new(0)),
