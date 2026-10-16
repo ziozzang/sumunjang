@@ -182,32 +182,75 @@ impl<'a> Tracer<'a> for Evidence<'a> {
 pub const AUTOMATIC_BLOCK_REASON: &str = "automatic threshold";
 pub const APPROVED_BLOCK_REASON: &str = "manual candidate approval";
 
+/// Decision reason codes as a compact enum (metrics index; `as_str` is the
+/// stable `sumunjang.*` code).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ReasonCode {
+    ObserveMode,
+    AllowAllowlist,
+    AllowRule,
+    #[default]
+    AllowDefault,
+    DenyRule,
+    DenyBlockManual,
+    DenyBlockApproved,
+    DenyBlockAutomatic,
+    DenyBlockSource,
+}
+impl ReasonCode {
+    pub const ALL: [ReasonCode; 9] = [
+        Self::ObserveMode,
+        Self::AllowAllowlist,
+        Self::AllowRule,
+        Self::AllowDefault,
+        Self::DenyRule,
+        Self::DenyBlockManual,
+        Self::DenyBlockApproved,
+        Self::DenyBlockAutomatic,
+        Self::DenyBlockSource,
+    ];
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ObserveMode => "sumunjang.observe.mode",
+            Self::AllowAllowlist => "sumunjang.allow.allowlist",
+            Self::AllowRule => "sumunjang.allow.rule",
+            Self::AllowDefault => "sumunjang.allow.default",
+            Self::DenyRule => "sumunjang.deny.rule",
+            Self::DenyBlockManual => "sumunjang.deny.block_manual",
+            Self::DenyBlockApproved => "sumunjang.deny.block_approved",
+            Self::DenyBlockAutomatic => "sumunjang.deny.block_automatic",
+            Self::DenyBlockSource => "sumunjang.deny.block_source",
+        }
+    }
+    pub fn classify(stage: DecidingStage, rule: Option<&Rule>, block: Option<&Block>) -> Self {
+        match stage {
+            DecidingStage::Observe => Self::ObserveMode,
+            DecidingStage::Allowlist => Self::AllowAllowlist,
+            DecidingStage::Default => Self::AllowDefault,
+            DecidingStage::Rule => match rule.map(|r| r.action) {
+                Some(RuleAction::Deny) => Self::DenyRule,
+                _ => Self::AllowRule,
+            },
+            // Provenance decides; pre-provenance blocks fall back to Sumunjang's
+            // own fixed reasons.
+            DecidingStage::Block => match block.map(|b| (b.origin.source, b.reason.as_str())) {
+                Some((BlockSource::Auto, _))
+                | Some((BlockSource::Unknown, AUTOMATIC_BLOCK_REASON)) => Self::DenyBlockAutomatic,
+                Some((BlockSource::Approved, _))
+                | Some((BlockSource::Unknown, APPROVED_BLOCK_REASON)) => Self::DenyBlockApproved,
+                Some((BlockSource::Kubernetes, _)) => Self::DenyBlockSource,
+                _ => Self::DenyBlockManual,
+            },
+        }
+    }
+}
+
 /// Stable namespaced reason code for a decision (ADR 0019 `sumunjang.*`).
 pub fn reason_code(
     stage: DecidingStage,
     rule: Option<&Rule>,
     block: Option<&Block>,
 ) -> &'static str {
-    match stage {
-        DecidingStage::Observe => "sumunjang.observe.mode",
-        DecidingStage::Allowlist => "sumunjang.allow.allowlist",
-        DecidingStage::Default => "sumunjang.allow.default",
-        DecidingStage::Rule => match rule.map(|r| r.action) {
-            Some(RuleAction::Deny) => "sumunjang.deny.rule",
-            _ => "sumunjang.allow.rule",
-        },
-        // Provenance decides; pre-provenance blocks fall back to Sumunjang's
-        // own fixed reasons.
-        DecidingStage::Block => match block.map(|b| (b.origin.source, b.reason.as_str())) {
-            Some((BlockSource::Auto, _)) | Some((BlockSource::Unknown, AUTOMATIC_BLOCK_REASON)) => {
-                "sumunjang.deny.block_automatic"
-            }
-            Some((BlockSource::Approved, _))
-            | Some((BlockSource::Unknown, APPROVED_BLOCK_REASON)) => {
-                "sumunjang.deny.block_approved"
-            }
-            Some((BlockSource::Kubernetes, _)) => "sumunjang.deny.block_source",
-            _ => "sumunjang.deny.block_manual",
-        },
-    }
+    ReasonCode::classify(stage, rule, block).as_str()
 }

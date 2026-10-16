@@ -1,6 +1,7 @@
 //! The production decision instantiation (NoTrace) and the fixed-size decision
 //! evidence sink must not allocate on any path; explain (VecTrace) must decide
 //! exactly like the live path.
+use guard_core::metrics::{METRICS, Transport};
 use guard_core::{
     AsnPrefix, Block, Engine, GeoContext, Mode, Policy, Rule, RuleAction, RuleSet,
     trace::{DecidingStage, Evidence, NoTrace, VecTrace},
@@ -180,7 +181,11 @@ fn production_and_evidence_paths_are_allocation_free_for_every_stage() {
             for ip in &ips {
                 for geo in geos {
                     for now in [100, 130, 2_000] {
+                        let started = std::time::Instant::now();
                         let d = view.query_ip_context(*ip, now, geo);
+                        // Production metrics recording is part of the measured path.
+                        METRICS.decision(Transport::Hgd1, d.mode, d.code);
+                        METRICS.latency(Transport::Hgd1, started.elapsed());
                         zones_seen |= view.zone_mask(*ip);
                         denies += usize::from(d.action == "deny");
                         std::hint::black_box(view.query_ip(*ip, now));
@@ -195,6 +200,10 @@ fn production_and_evidence_paths_are_allocation_free_for_every_stage() {
         }
     });
     assert_eq!(count, 0, "production decisions allocated {count} times");
+    assert!(METRICS.latency_count(Transport::Hgd1) > 0);
+    let mut text = String::new();
+    METRICS.render(&mut text);
+    assert!(text.contains("reason=\"sumunjang.deny.block_automatic\""));
     assert!(denies > 0);
     assert_eq!(
         zones_seen, 0b11,
@@ -236,6 +245,15 @@ fn traced_evaluation_has_parity_with_live_decisions() {
                 let mut evidence = Evidence::default();
                 let e = view.evaluate(ip, now, geo, &mut evidence);
                 assert_eq!((e.action, e.reason), (live.action, live.reason));
+                assert_eq!(
+                    live.code.as_str(),
+                    guard_core::trace::reason_code(
+                        evidence.stage.unwrap(),
+                        evidence.winner,
+                        evidence.block
+                    ),
+                    "{ip} {now} {mode:?}"
+                );
                 if mode == Mode::Observe {
                     assert_eq!(evidence.stage, Some(DecidingStage::Observe));
                     assert_eq!(live.action, "allow");

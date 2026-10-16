@@ -1,4 +1,5 @@
 pub mod history;
+pub mod metrics;
 pub mod reasons;
 pub mod rules;
 pub mod trace;
@@ -1279,6 +1280,9 @@ pub struct DecisionRef<'a> {
     pub mode: Mode,
     pub reason: Option<&'a str>,
     pub ttl_ms: u64,
+    /// Stable reason code of this decision (not serialized; metrics/evidence).
+    #[serde(skip)]
+    pub code: trace::ReasonCode,
 }
 impl DecisionView {
     pub fn query_ip(&self, ip: IpAddr, now: u64) -> DecisionRef<'_> {
@@ -1629,12 +1633,14 @@ fn evaluate<'a, T: Tracer<'a>>(
         mode,
         reason: None,
         ttl_ms: 5000,
+        code: trace::ReasonCode::AllowDefault,
     };
     trace.event(TraceEvent::Mode { mode });
     if mode != Mode::Enforce {
         trace.event(TraceEvent::Outcome {
             stage: DecidingStage::Observe,
         });
+        d.code = trace::ReasonCode::ObserveMode;
         return d;
     }
     let allowed = allow.longest_prefix_where(ip, |expires| *expires > now);
@@ -1645,6 +1651,7 @@ fn evaluate<'a, T: Tracer<'a>>(
         trace.event(TraceEvent::Outcome {
             stage: DecidingStage::Allowlist,
         });
+        d.code = trace::ReasonCode::AllowAllowlist;
         return d;
     }
     if !rules.rules.is_empty() {
@@ -1683,6 +1690,7 @@ fn evaluate<'a, T: Tracer<'a>>(
                     trace.event(TraceEvent::Outcome {
                         stage: DecidingStage::Rule,
                     });
+                    d.code = trace::ReasonCode::classify(DecidingStage::Rule, Some(rule), None);
                     return d;
                 }
                 RuleAction::Deny => {
@@ -1691,6 +1699,7 @@ fn evaluate<'a, T: Tracer<'a>>(
                     trace.event(TraceEvent::Outcome {
                         stage: DecidingStage::Rule,
                     });
+                    d.code = trace::ReasonCode::classify(DecidingStage::Rule, Some(rule), None);
                     return d;
                 }
             }
@@ -1719,6 +1728,7 @@ fn evaluate<'a, T: Tracer<'a>>(
         trace.event(TraceEvent::Outcome {
             stage: DecidingStage::Block,
         });
+        d.code = trace::ReasonCode::classify(DecidingStage::Block, None, Some(block.as_ref()));
     } else {
         trace.event(TraceEvent::Outcome {
             stage: DecidingStage::Default,
