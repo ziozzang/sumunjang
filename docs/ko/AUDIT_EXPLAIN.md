@@ -20,6 +20,7 @@ gRPC·HTTP 판정에 추가되는 근거(evidence)를 제공한다. 별도 표�
 | `rules.replace`, `rules.lua.replace` | `PUT /v1/rules`, `PUT /v1/rules/lua` (Lua 컴파일 실패는 거부로 기록) |
 | `geoip.reload` | `POST /v1/geoip/reload` |
 | `update.check` | `POST /v1/update/check` |
+| `allowlist.add`, `allowlist.remove` | `POST`/`DELETE /v1/allowlist` |
 | `kubernetes.authority.publish` | 내용이 바뀐 네이티브 `--kubernetes-authority` 게시 |
 | `startup.import` | 시작 시 `--policy`, `--bootstrap-policy`, `--asn-catalog`가 저장 상태를 바꾼 경우 |
 
@@ -126,7 +127,7 @@ explain과 batch는 읽기 요청이다. 제한된 작업자 풀을 쓰고 관�
 `{name}` 자리표시자는 `params`로 채운다. 판정 코드: `sumunjang.observe.mode`,
 `sumunjang.allow.allowlist`, `sumunjang.allow.rule`, `sumunjang.allow.default`,
 `sumunjang.deny.rule`, `sumunjang.deny.block_manual`, `sumunjang.deny.block_approved`,
-`sumunjang.deny.block_automatic`, `sumunjang.unavailable.revision_floor`,
+`sumunjang.deny.block_automatic`, `sumunjang.deny.block_source`, `sumunjang.unavailable.revision_floor`,
 `sumunjang.unavailable.owner_replaced`, `sumunjang.unavailable.source`. 테스트가 두
 언어의 키 집합과 자리표시자가 같은지 확인하며, 코드를 추가하려면 두 메시지가 모두
 필요하다.

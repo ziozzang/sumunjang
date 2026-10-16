@@ -59,3 +59,9 @@ HTTP 409를 반환하며 화면은 초안을 유지합니다. 명시적으로 �
 `"delegate_actor": true`, `"delegation_authority": "hangang"`을 두고 Guard 관리자
 자격(32바이트 이상)을 `token_env`로 지정한다. 수문장은 서명된 행위자 단언을
 검증하며 잘못된 단언은 거부한다. [감사·explain](AUDIT_EXPLAIN.md) 참고.
+
+## 네트워크 API 경로(패키지 0.1.6)
+
+패키지 0.1.6은 `rules/document`(GET), `history/query`·`asn/catalog/query`(POST, 읽기
+전용), `allowlist`(GET, POST·DELETE는 변경)를 추가한다. 룰·허용 목록은 CAS 쓰기를
+권장한다. [콘솔 네트워크 API](CONSOLE_NETWORK_API.md) 참고.

@@ -62,6 +62,7 @@ Hook은 실행 예산이며 OS 프로세스 격리를 대신하지 않습니다.
 - `POST /v1/rules/validate`: `{rules: RuleSet}` 또는 `{script: ...}` 중 하나를 받아
   정책 변경 없이 `{valid: true, rules: RuleSet}` 반환.
 - `PUT /v1/rules/lua`: `{script: ...}` 컴파일 및 영속 적용.
+- `GET /v1/rules/document`는 `{revision, rules, source, script}`를 반환한다. `PUT /v1/rules`에 `{expected_revision, rules, reason?}`(또는 `PUT /v1/rules/lua`에 `expected_revision`)를 보내면 CAS로 적용한다(409와 `current_revision`). 무조건 쓰기는 사용 중단 예정이다. [콘솔 네트워크 API](CONSOLE_NETWORK_API.md) 참고.
 
 Snapshot v1은 동적 룰을 전달하지 않습니다. 룰이 있으면 `/v1/snapshot`은 501을
 반환하여 불완전한 정책 배포를 막습니다. HTTP 또는 바이너리 query 모드를 사용하세요.

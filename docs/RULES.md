@@ -67,6 +67,11 @@ API (admin token):
 - `POST /v1/rules/validate` with exactly one of `{rules: RuleSet}` or `{script: ...}`
   returns `{valid: true, rules: RuleSet}` without modifying policy.
 - `PUT /v1/rules/lua` with `{script: ...}` compiles and durably applies.
+- `GET /v1/rules/document` returns `{revision, rules, source, script}`; send
+  `{expected_revision, rules, reason?}` to `PUT /v1/rules` (or
+  `expected_revision` with `PUT /v1/rules/lua`) for compare-and-set (409 with
+  `current_revision`). Unconditional writes are deprecated. See
+  [console Network APIs](CONSOLE_NETWORK_API.md).
 
 Snapshots v1 do not carry dynamic rules. `/v1/snapshot` returns 501 when rules are
 nonempty to prevent a silently incomplete policy. Use HTTP or binary query mode

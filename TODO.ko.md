@@ -553,3 +553,17 @@ HTTPS Chromium 검증에서 재마운트 없는 영어/한국어 전환·뒤로/
 HTTP 점검도 통과했다. 남은 일: 새 필드의 Python gRPC 점검, 한강의 근거 사용과 Guard
 바인딩 행위자 위임 적용, 콘솔 화면, `NetworkZone` 소유(ADR 0021/0022), 행위자별
 explain 속도 제한, 통합 콘솔 저장소로의 감사 내보내기.
+
+## 콘솔 네트워크 API 공백 — 2026-10-16
+
+브랜치 `feat/console-api-gaps`(`feat/audit-explain-api` 기반, 로컬만, push·배포 안 함)는
+콘솔 네트워크 화면 재구성에서 드러난 공백을 추가형으로 메웠다. 주소별 분 단위 신호
+이력(`/v1/history`, 메모리 전용, `--history-hours`), 후보의 신호별 횟수·국가, 와이어
+형식 밖에 기록하고 사유 코드에 쓰는 차단 출처(source/created_at/created_by), 룰
+CAS(`/v1/rules/document`, `expected_revision`, `current_revision` 포함 409, 무조건
+쓰기는 사용 중단 예정)와 Lua 원문 보관, 오프라인 ASN 카탈로그 조회(`/v1/asn/catalog`),
+감사에 기록되는 선택 변경 사유, CAS 기반 만료·사유가 있는 허용 목록 항목
+(`/v1/allowlist`, 이전 정책 쓰기도 항목 메타데이터 유지)이다. 콘솔 패키지 0.1.6은
+31개 경로를 선언한다. 코어 42·no_alloc 2·서버 78개 테스트와 Clippy가 통과했다.
+남은 일: 콘솔 화면, 재시작 간 이력 보존(의도적으로 제외), 만료 허용 항목 정리 작업,
+ASN 제안 흐름, 클라이언트 이전 후 무조건 룰 쓰기 제거.

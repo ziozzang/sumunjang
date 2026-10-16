@@ -76,3 +76,10 @@ the shared credential, set `"delegate_actor": true` and
 `"delegation_authority": "hangang"` on the Guard binding with the Guard admin
 credential (≥ 32 bytes) as `token_env`; Sumunjang verifies the signed actor
 assertion and refuses invalid ones. See [audit and explain](AUDIT_EXPLAIN.md).
+
+## Network API routes (package 0.1.6)
+
+Package 0.1.6 adds `rules/document` (GET), `history/query` and
+`asn/catalog/query` (POST, read-only) and `allowlist` (GET; POST and DELETE as
+mutations). Prefer the compare-and-set rules and allowlist writes; see
+[console Network APIs](CONSOLE_NETWORK_API.md).

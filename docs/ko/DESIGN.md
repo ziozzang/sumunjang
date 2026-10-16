@@ -75,6 +75,7 @@ Admin API:
 - `POST /v1/candidates/approve`: `{ip}`로 정확한 IP 차단 승인.
 - `GET /v1/audit`, `POST /v1/audit/query`: 정책 변경 감사(필터, 커서).
 - `POST /v1/explain`, `POST /v1/explain/batch`, `GET /v1/reasons`: 실시간 평가 경로의 explain/what-if와 사유 카탈로그. AUDIT_EXPLAIN.md 참고.
+- `GET /v1/history`, `GET/POST/DELETE /v1/allowlist`, `GET /v1/rules/document`, `GET /v1/asn/catalog`: 콘솔 네트워크 API. CONSOLE_NETWORK_API.md 참고.
 - `/`: 정적 대시보드; 토큰은 브라우저 메모리만 사용하고 local storage/내장 토큰/외부 스크립트/비정제 evidence HTML은 없습니다.
 
 Policy: `{mode, auto_block, window_secs, threshold, block_ttl_secs, allow,

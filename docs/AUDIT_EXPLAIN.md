@@ -21,6 +21,7 @@ Every administrative mutation writes one audit row:
 | `rules.replace`, `rules.lua.replace` | `PUT /v1/rules`, `PUT /v1/rules/lua` (Lua compile failures are refusals) |
 | `geoip.reload` | `POST /v1/geoip/reload` |
 | `update.check` | `POST /v1/update/check` |
+| `allowlist.add`, `allowlist.remove` | `POST`/`DELETE /v1/allowlist` |
 | `kubernetes.authority.publish` | native `--kubernetes-authority` publication whose content changed |
 | `startup.import` | `--policy`, `--bootstrap-policy`, `--asn-catalog` changing stored state at startup |
 
@@ -154,7 +155,7 @@ equal the codes; messages use `{name}` placeholders filled from `params`.
 Decision codes: `sumunjang.observe.mode`, `sumunjang.allow.allowlist`,
 `sumunjang.allow.rule`, `sumunjang.allow.default`, `sumunjang.deny.rule`,
 `sumunjang.deny.block_manual`, `sumunjang.deny.block_approved`,
-`sumunjang.deny.block_automatic`, `sumunjang.unavailable.revision_floor`,
+`sumunjang.deny.block_automatic`, `sumunjang.deny.block_source`, `sumunjang.unavailable.revision_floor`,
 `sumunjang.unavailable.owner_replaced`, `sumunjang.unavailable.source`. Tests
 require identical key sets and placeholders in both languages; adding a code
 requires both messages.

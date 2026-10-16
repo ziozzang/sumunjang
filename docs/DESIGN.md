@@ -110,6 +110,8 @@ Admin endpoints (admin bearer only):
 - GET /v1/audit, POST /v1/audit/query: policy-change audit (filters, cursor).
 - POST /v1/explain, POST /v1/explain/batch, GET /v1/reasons: explain/what-if on
   the live evaluation path and the reason catalog. See AUDIT_EXPLAIN.md.
+- GET /v1/history, GET/POST/DELETE /v1/allowlist, GET /v1/rules/document,
+  GET /v1/asn/catalog: console Network APIs. See CONSOLE_NETWORK_API.md.
 - Dashboard /: static HTML, credential entered in browser memory only; no local
   storage, embedded token, external scripts or unsanitized evidence HTML.
 

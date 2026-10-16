@@ -622,3 +622,21 @@ HTTP smoke passed. Open: Python gRPC smoke with the new field, Hangang client
 adoption of evidence and actor delegation for the Guard binding, console views,
 `NetworkZone` ownership (ADR 0021/0022), explain rate limits per actor and audit
 export/forwarding to the unified console store.
+
+## Console Network API gaps — 2026-10-16
+
+Branch `feat/console-api-gaps` (on `feat/audit-explain-api`; local, not pushed
+or deployed) closes gaps found by the console Network rebuild, additively:
+bounded per-minute per-address signal history (`/v1/history`, memory only,
+`--history-hours`), per-signal counts and country on candidates, block
+provenance (source/created_at/created_by) recorded outside the wire shape and
+used for reason codes, rules compare-and-set (`/v1/rules/document`,
+`expected_revision`, 409 with `current_revision`; unconditional writes
+deprecated) with retained Lua source, offline ASN catalog listing
+(`/v1/asn/catalog`), optional audited change reasons, and allowlist entries with
+expiry/reason under compare-and-set (`/v1/allowlist`) while legacy policy writes
+keep entry metadata. Console package 0.1.6 declares 31 routes. Core 42 +
+no_alloc 2 and server 78 tests and strict Clippy pass. Open: console views,
+history persistence across restarts (deliberately not done), allowlist expiry
+cleanup job, ASN proposal workflow, removal of deprecated unconditional rules
+writes after clients migrate.
