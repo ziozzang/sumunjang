@@ -5,7 +5,7 @@ pub mod rules;
 pub mod trace;
 pub mod zones;
 use rules::CompiledRules;
-pub use rules::{GeoContext, Rule, RuleAction, RuleSet, Suspicion};
+pub use rules::{GeoContext, RiskBucket, Rule, RuleAction, RuleSet, Suspicion};
 use trace::{AsnSource, DecidingStage, NoTrace, TraceEvent, Tracer};
 pub mod network_policy;
 pub mod pod_peers;
@@ -580,6 +580,31 @@ impl Engine {
         self.prune(now);
         self.aggregates.get(&ip.to_string()).map_or(0, |a| {
             a.buckets.values().fold(0u64, |s, b| s.saturating_add(b.0))
+        })
+    }
+    /// Current evidence signal score without pruning or allocation (decision
+    /// evidence path; the caller holds only a read of the engine).
+    pub fn signal_score_at(&self, ip: IpAddr, now: u64) -> u64 {
+        use std::io::Write;
+        let ip = match ip {
+            IpAddr::V6(v) => v.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+            _ => ip,
+        };
+        let mut buf = [0u8; 48];
+        let mut cursor = std::io::Cursor::new(&mut buf[..]);
+        if write!(cursor, "{ip}").is_err() {
+            return 0;
+        }
+        let len = cursor.position() as usize;
+        let Ok(key) = std::str::from_utf8(&buf[..len]) else {
+            return 0;
+        };
+        let window = self.policy.window_secs;
+        self.aggregates.get(key).map_or(0, |a| {
+            a.buckets
+                .iter()
+                .filter(|(t, _)| **t <= now && now - **t < window)
+                .fold(0u64, |s, (_, b)| s.saturating_add(b.0))
         })
     }
     /// Active blocks (for audit digests and summaries).
@@ -1365,6 +1390,14 @@ impl DecisionView {
         };
         let m = self.rules.matching(ip, now, geo);
         (m.score, self.rules.matching_ids(&m))
+    }
+    /// Sum of active matching rule scores; allocation-free.
+    pub fn rule_score_value(&self, ip: IpAddr, now: u64, geo: GeoContext<'_>) -> u64 {
+        let geo = GeoContext {
+            country: geo.country,
+            asn: geo.asn.or_else(|| self.asns.longest(ip).copied()),
+        };
+        self.rules.matching(ip, now, geo).score
     }
     /// A never-published view with additional blocks (proposal previews).
     pub fn with_blocks(&self, blocks: &[Block]) -> Result<Self> {
@@ -2253,5 +2286,46 @@ mod zone_engine_tests {
         assert!(!r.remove_zone("corp").unwrap());
         assert_eq!(r.zones().revision, 2);
         assert_eq!(r.decision_view().zone_mask("10.2.3.4".parse().unwrap()), 0);
+    }
+}
+
+#[cfg(test)]
+mod risk_score_tests {
+    use super::*;
+    #[test]
+    fn allocation_free_signal_score_matches_pruning_read() {
+        let mut e = Engine::new(Policy::default()).unwrap();
+        for (ip, t) in [
+            ("192.0.2.1", 100),
+            ("192.0.2.1", 130),
+            ("::ffff:192.0.2.2", 100),
+        ] {
+            e.ingest(
+                EventBatch {
+                    source_id: "t".into(),
+                    events: vec![Event {
+                        ip: ip.into(),
+                        kind: EventKind::Scanner,
+                        observed_at: t,
+                    }],
+                },
+                t,
+            )
+            .unwrap();
+        }
+        for (ip, now) in [
+            ("192.0.2.1", 130),
+            ("192.0.2.1", 170),
+            ("::ffff:192.0.2.2", 130),
+            ("192.0.2.9", 130),
+        ] {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert_eq!(
+                e.signal_score_at(ip, now),
+                e.clone()
+                    .signal_score(canonical_ip(&ip.to_string()).unwrap(), now),
+                "{ip} {now}"
+            );
+        }
     }
 }

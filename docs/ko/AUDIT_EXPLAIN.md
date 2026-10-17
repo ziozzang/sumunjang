@@ -154,3 +154,6 @@ GeoIP/오프라인 카탈로그 조회 결과다. `block`은 네트워크 주소
 주소와 기본 경로에서 `NoTrace`와 고정 크기 `Evidence` 싱크의 할당이 0임을 확인하고
 추적/비추적 동등성을 검사한다. 서버 테스트는 두 모드 각각 293개 주소에서
 `/v1/explain`과 `/v1/decision`을 비교한다.
+
+HTTP 근거에는 `"risk": {"score": 0–100(10 단위), "stage": "normal|watch|suspicious|high|blocked"}`도
+들어간다(근거 저장소가 사용 중이면 `null`). 정의는 [gRPC](GRPC.md) 참고.

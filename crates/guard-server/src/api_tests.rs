@@ -2801,3 +2801,47 @@ async fn asn_bundle_fetch_over_https_and_offline_import() {
         .unwrap();
     assert_eq!(audited, "asn.bundle.install");
 }
+
+#[tokio::test]
+async fn decision_evidence_carries_a_coarse_risk_bucket() {
+    let a = app();
+    events(&a, "198.51.100.7", &["honeypot", "scanner"]).await;
+    let r = call(
+        &a,
+        "POST",
+        "/v1/decision",
+        COLLECTOR,
+        Some(json!({"source_id":"t","ip":"198.51.100.7","evidence":true})),
+    )
+    .await
+    .body;
+    // 15 of threshold 10 -> 15 / 30 = 50%, stage suspicious.
+    assert_eq!(
+        r["evidence"]["risk"],
+        json!({"score": 50, "stage": "suspicious"})
+    );
+    let clean = call(
+        &a,
+        "POST",
+        "/v1/decision",
+        COLLECTOR,
+        Some(json!({"source_id":"t","ip":"192.0.2.1","evidence":true})),
+    )
+    .await
+    .body;
+    assert_eq!(
+        clean["evidence"]["risk"],
+        json!({"score": 0, "stage": "normal"})
+    );
+    // A busy engine yields no bucket instead of waiting.
+    let guard = a.inner.lock().unwrap();
+    assert!(
+        a.risk_inputs("198.51.100.7".parse().unwrap(), crate::now())
+            .is_none()
+    );
+    drop(guard);
+    // gRPC carries the same bucket (fields 13/14) within the encode bound.
+    let reply = crate::grpc::fixture_evidence(a.clone(), vec![198, 51, 100, 7]).await;
+    let e = reply.evidence.unwrap();
+    assert_eq!((e.risk_score, e.risk_stage), (50, 3));
+}

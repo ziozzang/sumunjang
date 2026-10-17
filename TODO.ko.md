@@ -632,3 +632,7 @@ PrometheusRule, OpenMetrics 협상.
 옮겼다. 코어 47·no_alloc 2·서버 93·업데이트 17개 테스트와 Clippy가 통과했다. 남은 일:
 한강 판정 로그 집계 자동 조회(현재는 콘솔이 첨부), 콘솔 화면, 라이선스 제공자 기반 번들
 게시 파이프라인, LLM 보조 허용 목록 검토(5단계는 수동/검토 유지).
+
+근거 위험 구간(브랜치 `feat/evidence-score`, 로컬): gRPC `NetworkEvidence.risk_score`(13)·
+`risk_stage`(14)와 HTTP 근거 `risk`가 10 단위 0–100 점수와 위험 단계를 추가한다. 할당 없이,
+엔진 잠금을 기다리지 않고 계산한다.

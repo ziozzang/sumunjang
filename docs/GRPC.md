@@ -90,3 +90,12 @@ to the 1 KiB encode bound). See [network zones](NETWORK_ZONES.md).
 
 TLS material reloads without restart; gRPC TLS terminates in Sumunjang before
 tonic with the same bounds. See [operations](OPERATIONS.md).
+
+Risk bucket: `NetworkEvidence.risk_score` (13) is the evidence signal score plus
+matching rule scores as a percentage of three times the evidence threshold
+(the start of `high`), rounded down to tens and capped at 100;
+`risk_stage` (14, `RiskStage`: normal, watch, suspicious, high, blocked) is the
+`/v1/lookup` suspicion stage (`blocked` when the live decision denies).
+`RISK_STAGE_UNSPECIFIED` with score 0 means the evidence store was busy; the
+reply never waits for it. The computation reads aggregates without allocation
+(no_alloc covered); replies stay within the 1 KiB encode bound.

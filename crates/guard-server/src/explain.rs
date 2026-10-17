@@ -691,6 +691,8 @@ pub struct DecisionEvidence {
     pub zones: Vec<String>,
     pub zones_truncated: bool,
     pub zone_revision: u64,
+    /// Coarse risk bucket; `None` when the evidence store was busy.
+    pub risk: Option<guard_core::RiskBucket>,
 }
 /// Evaluate `ip` on `view` with the live geo input and collect evidence. In
 /// observe mode the matched rules and enforce outcome come from evaluating the
@@ -700,6 +702,7 @@ pub fn decision_evidence(
     catalog: &crate::geoip::GeoCatalog,
     ip: IpAddr,
     time: u64,
+    signal: Option<(u64, u64)>,
 ) -> (DecisionEvidence, &'static str) {
     let full = catalog.context(ip);
     let zone_mask = view.zone_mask(ip);
@@ -736,9 +739,27 @@ pub fn decision_evidence(
                 .collect(),
             zones_truncated: zone_mask.count_ones() as usize > MAX_EVIDENCE_ZONES,
             zone_revision: view.zones().revision,
+            // Coarse risk: evidence signal + matching rule scores (as /v1/lookup).
+            risk: signal.map(|(score, threshold)| {
+                guard_core::RiskBucket::new(
+                    score.saturating_add(view.rule_score_value(ip, time, full)),
+                    threshold,
+                    action == "deny",
+                )
+            }),
         },
         action,
     )
+}
+fn risk_stage(stage: guard_core::Suspicion) -> &'static str {
+    use guard_core::Suspicion as S;
+    match stage {
+        S::Normal => "normal",
+        S::Watch => "watch",
+        S::Suspicious => "suspicious",
+        S::High => "high",
+        S::Blocked => "blocked",
+    }
 }
 impl DecisionEvidence {
     pub fn to_json(&self, mode: Mode, revision: u64) -> Value {
@@ -758,6 +779,7 @@ impl DecisionEvidence {
             "zones": self.zones,
             "zones_truncated": self.zones_truncated,
             "zone_revision": self.zone_revision,
+            "risk": self.risk.map(|r| json!({"score": r.score, "stage": risk_stage(r.stage)})),
         })
     }
 }

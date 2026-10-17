@@ -195,3 +195,6 @@ observe rule, block, expired block, automatic block, IPv4/IPv6/mapped and defaul
 paths, for both `NoTrace` and the fixed-size `Evidence` sink, and checks
 traced/untraced parity. Server tests compare `/v1/explain` with `/v1/decision`
 for 293 addresses in each mode.
+
+HTTP evidence also carries `"risk": {"score": 0-100 (tens), "stage": "normal|watch|suspicious|high|blocked"}`
+(`null` when the evidence store was busy); see [gRPC](GRPC.md) for the definition.

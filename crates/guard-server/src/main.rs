@@ -204,6 +204,16 @@ fn metrics_token(collector: &str, admin: &str) -> anyhow::Result<Option<String>>
     }
 }
 impl App {
+    /// (signal score, threshold) without waiting: a busy engine (evidence
+    /// ingestion or administration in progress) yields `None` instead of
+    /// blocking a decision reply.
+    fn risk_inputs(&self, ip: std::net::IpAddr, time: u64) -> Option<(u64, u64)> {
+        let inner = self.inner.try_lock().ok()?;
+        Some((
+            inner.engine.signal_score_at(ip, time),
+            inner.engine.policy().threshold,
+        ))
+    }
     /// Readiness: a fresh native source (when configured) and a healthy
     /// durable checkpoint. TLS reload failures keep the previous valid
     /// material serving and do not affect readiness (see `GET /v1/status`).
@@ -652,7 +662,8 @@ fn decision_with_evidence(app: &App, decision: Value, ip: std::net::IpAddr, time
     let mut decision = decision;
     let view = app.view.load_full();
     let catalog = app.geo.load_full();
-    let (evidence, _) = explain::decision_evidence(&view, &catalog, ip, time);
+    let (evidence, _) =
+        explain::decision_evidence(&view, &catalog, ip, time, app.risk_inputs(ip, time));
     decision["evidence"] = evidence.to_json(view.mode, view.revision);
     Json(decision).into_response()
 }

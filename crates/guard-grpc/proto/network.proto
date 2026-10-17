@@ -43,4 +43,13 @@ message NetworkEvidence {
  bool zone_ids_truncated = 11;
  // Sumunjang zone revision (Pumgye zone snapshot revision).
  uint64 zone_revision = 12;
+ // Coarse risk: evidence signal + rule score as a percentage of three times the
+ // evidence threshold, rounded down to tens (0-100). Meaningful only when
+ // risk_stage is not RISK_STAGE_UNSPECIFIED (unspecified: evidence store busy).
+ uint32 risk_score = 13;
+ RiskStage risk_stage = 14;
+}
+enum RiskStage {
+ RISK_STAGE_UNSPECIFIED = 0; RISK_STAGE_NORMAL = 1; RISK_STAGE_WATCH = 2;
+ RISK_STAGE_SUSPICIOUS = 3; RISK_STAGE_HIGH = 4; RISK_STAGE_BLOCKED = 5;
 }

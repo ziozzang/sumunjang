@@ -192,6 +192,25 @@ pub enum Suspicion {
     High,
     Blocked,
 }
+/// Coarse risk bucket for decision evidence: score as a percentage of three
+/// times the evidence threshold (the start of `high`), rounded down to tens and
+/// capped at 100, plus the suspicion stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RiskBucket {
+    pub score: u8,
+    pub stage: Suspicion,
+}
+impl RiskBucket {
+    #[inline]
+    pub fn new(total: u64, threshold: u64, blocked: bool) -> Self {
+        let high = threshold.max(1).saturating_mul(3);
+        let pct = total.saturating_mul(100) / high;
+        Self {
+            score: (pct.min(100) / 10 * 10) as u8,
+            stage: Suspicion::from_score(total, threshold, blocked),
+        }
+    }
+}
 impl Suspicion {
     pub fn from_score(score: u64, threshold: u64, blocked: bool) -> Self {
         if blocked {
@@ -761,5 +780,51 @@ mod catalog_rules_tests {
                 .action,
             "deny"
         );
+    }
+}
+
+#[cfg(test)]
+mod risk_bucket_tests {
+    use super::*;
+    #[test]
+    fn buckets_round_down_to_tens_and_cap() {
+        let b = |t, th, blocked| RiskBucket::new(t, th, blocked);
+        assert_eq!(
+            b(0, 10, false),
+            RiskBucket {
+                score: 0,
+                stage: Suspicion::Normal
+            }
+        );
+        assert_eq!(
+            b(5, 10, false),
+            RiskBucket {
+                score: 10,
+                stage: Suspicion::Watch
+            }
+        );
+        assert_eq!(
+            b(10, 10, false),
+            RiskBucket {
+                score: 30,
+                stage: Suspicion::Suspicious
+            }
+        );
+        assert_eq!(
+            b(29, 10, false),
+            RiskBucket {
+                score: 90,
+                stage: Suspicion::Suspicious
+            }
+        );
+        assert_eq!(
+            b(1000, 10, false),
+            RiskBucket {
+                score: 100,
+                stage: Suspicion::High
+            }
+        );
+        assert_eq!(b(0, 10, true).stage, Suspicion::Blocked);
+        assert_eq!(b(u64::MAX, 0, false).score, 100);
     }
 }

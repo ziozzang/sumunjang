@@ -121,7 +121,13 @@ impl Service {
     ) -> NetworkReply {
         let catalog = self.app.geo.load_full();
         let time = crate::now();
-        let (evidence, _) = crate::explain::decision_evidence(view, &catalog, ip, time);
+        let (evidence, _) = crate::explain::decision_evidence(
+            view,
+            &catalog,
+            ip,
+            time,
+            self.app.risk_inputs(ip, time),
+        );
         // The verdict itself is the unmodified live decision.
         let decision = if view.requires_geo() {
             view.query_ip_context(ip, time, catalog.context(ip))
@@ -161,6 +167,8 @@ impl Service {
                 zone_ids: evidence.zones,
                 zone_ids_truncated: evidence.zones_truncated,
                 zone_revision: evidence.zone_revision,
+                risk_score: evidence.risk.map_or(0, |r| u32::from(r.score)),
+                risk_stage: evidence.risk.map_or(0, |r| r.stage as i32 + 1),
             }
         });
         // Keep the reply within the 1 KiB encode bound: drop trailing zone ids.
@@ -370,6 +378,25 @@ pub(crate) async fn fixture_check(app: App, ip: Vec<u8>) -> Result<NetworkReply,
         "Bearer collector-test-token".parse().unwrap(),
     );
     service.check(request).await.map(Response::into_inner)
+}
+
+#[cfg(test)]
+pub(crate) async fn fixture_evidence(app: App, ip: Vec<u8>) -> NetworkReply {
+    let service = Service {
+        app,
+        requests: Arc::new(Semaphore::new(1)),
+    };
+    let mut request = Request::new(NetworkRequest {
+        request_id: 43,
+        ip,
+        minimum_revision: 0,
+        include_evidence: true,
+    });
+    request.metadata_mut().insert(
+        "authorization",
+        "Bearer collector-test-token".parse().unwrap(),
+    );
+    service.check(request).await.unwrap().into_inner()
 }
 
 #[cfg(test)]

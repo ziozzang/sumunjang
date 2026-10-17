@@ -719,3 +719,8 @@ Console package 0.2.0 moves to broker contract v2. Core 47 + no_alloc 2, server
 automatically (currently attached by the console), console views, bundle
 publishing pipeline from a licensed provider, LLM-assisted allowlist review
 (step 5 remains manual/reviewed).
+
+Evidence risk bucket (branch `feat/evidence-score`, local): gRPC
+`NetworkEvidence.risk_score` (13) / `risk_stage` (14) and HTTP evidence `risk`
+add a coarse 0–100 score in tens and the suspicion stage, computed
+allocation-free and without waiting on the engine lock.

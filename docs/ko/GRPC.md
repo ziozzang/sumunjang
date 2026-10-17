@@ -67,3 +67,10 @@ Check는 판정 전에 정확한 불변 정책 view와 필요한 경우 GeoIP �
 
 TLS 자료는 재시작 없이 재적재된다. gRPC TLS는 같은 한도로 tonic 앞에서 수문장이
 종료한다. [운영](OPERATIONS.md) 참고.
+
+위험 구간: `NetworkEvidence.risk_score`(13)는 근거 신호 점수와 일치 룰 점수의 합을
+근거 임계값의 3배(`high` 시작점)에 대한 백분율로 계산해 10 단위로 내림하고 100에서 자른
+값이다. `risk_stage`(14, `RiskStage`: normal, watch, suspicious, high, blocked)는
+`/v1/lookup`의 위험 단계다(실시간 판정이 거부면 `blocked`). 점수 0과
+`RISK_STAGE_UNSPECIFIED`는 근거 저장소가 사용 중이었다는 뜻이며 응답은 기다리지 않는다.
+계산은 할당 없이 집계를 읽고(no_alloc 확인) 응답은 1KiB 인코딩 한계 안이다.

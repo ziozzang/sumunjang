@@ -152,6 +152,27 @@ fn addresses() -> Vec<IpAddr> {
 #[test]
 fn production_and_evidence_paths_are_allocation_free_for_every_stage() {
     assert_eq!(std::mem::size_of::<NoTrace>(), 0);
+    let engines: Vec<_> = [(Mode::Enforce, true), (Mode::Observe, false)]
+        .into_iter()
+        .map(|(m, r)| {
+            let mut e = engine(m, r);
+            e.ingest(
+                guard_core::EventBatch {
+                    source_id: "t".into(),
+                    events: vec![guard_core::Event {
+                        ip: "198.51.100.9".into(),
+                        kind: guard_core::EventKind::Honeypot,
+                        observed_at: 100,
+                    }],
+                },
+                100,
+            )
+            .unwrap();
+            e
+        })
+        .collect();
+    let engine_views: Vec<_> = engines.iter().map(|e| e.decision_view()).collect();
+    let mut risk_seen = 0u64;
     let views: Vec<_> = [
         (Mode::Observe, false),
         (Mode::Observe, true),
@@ -199,6 +220,20 @@ fn production_and_evidence_paths_are_allocation_free_for_every_stage() {
             }
         }
     });
+    let risk_count = allocations(|| {
+        for (e, view) in engines.iter().zip(&engine_views) {
+            for ip in &ips {
+                let signal = e.signal_score_at(*ip, 100);
+                let rules = view.rule_score_value(*ip, 100, GeoContext::default());
+                let d = view.query_ip(*ip, 100);
+                let bucket = guard_core::RiskBucket::new(signal + rules, 10, d.action == "deny");
+                risk_seen += u64::from(bucket.score);
+            }
+            risk_seen += e.signal_score_at("::ffff:198.51.100.9".parse().unwrap(), 100);
+        }
+    });
+    assert_eq!(risk_count, 0, "risk evidence allocated {risk_count} times");
+    assert!(risk_seen >= 20, "{risk_seen}");
     assert_eq!(count, 0, "production decisions allocated {count} times");
     assert!(METRICS.latency_count(Transport::Hgd1) > 0);
     let mut text = String::new();
